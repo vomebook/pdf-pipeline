@@ -1,4 +1,6 @@
-
+output/
+__pycache__/
+*.pyc
 
 # Local documentation; only the repository README.md is published.
 *.[mM][dD]
