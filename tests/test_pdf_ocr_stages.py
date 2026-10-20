@@ -207,6 +207,30 @@ class PdfOcrStagesTests(unittest.TestCase):
             retried = stages.plan_images({result["key"]: result}, {}, progress)
             self.assertEqual(retried["total_ocr_pages"], 1)
 
+    def test_degenerate_three_pixel_page_is_retained_without_calling_ocr_engine(self):
+        import io
+        with Image.new("RGB", (2200, 3), "white") as image:
+            stream = io.BytesIO()
+            image.save(stream, format="PNG")
+        raw = stream.getvalue()
+        page = {"p": 283, "width": 2200, "height": 3, "source": "ocr",
+                "i": "objects/aa/" + "a" * 64 + "/" + "b" * 16 + "/ocr-input/page-000283.png",
+                "ib": len(raw), "is": hashlib.sha256(raw).hexdigest()}
+        task = {"key": "repo\0degenerate.pdf", "generation": "c" * 64,
+                "source_sha256": "d" * 64, "profile": "profile", "ocr_language": "ch",
+                "ocr_backend": "rapidocr_onnxruntime", "layout_options": {}, "pages": [page]}
+        with patch.object(stages, "read_object", return_value=raw), \
+                patch.object(pdf_ocr, "ocr_page", side_effect=AssertionError("degenerate page must skip OCR")):
+            result = stages.recognize_task(task, self.root / "degenerate-ocr")
+        self.assertEqual(result["errors"], [])
+        self.assertEqual(len(result["pages"]), 1)
+        self.store(self.root / "degenerate-ocr")
+        saved = result["pages"][0]
+        payload = json.loads(gzip.decompress(self.read(stages.page_meta(saved, "o"), ".json.gz")))
+        self.assertEqual(payload["text"], "")
+        self.assertEqual(payload["blocks"], [])
+        self.assertEqual(payload["ocr_warning"], "degenerate-image-below-minimum-side")
+
     def test_500_page_tasks_split_large_books_and_keep_every_page(self):
         result = self.render_fixture()
         manifest = json.loads(self.read(result["render_manifest"]))
@@ -491,13 +515,17 @@ class PdfOcrStagesTests(unittest.TestCase):
 
     def test_transfers_scope_each_book_not_whole_bucket(self):
         result = self.render_fixture()
-        with patch.object(stages, "HfApi") as api, patch.object(stages, "publish_json"):
+        uploads = []
+        with patch.object(stages.shared, "batch_bucket_files_with_retry",
+                          side_effect=lambda bucket, additions, token: uploads.append((bucket, additions))), \
+                patch.object(stages, "publish_json_batch"):
             stages.upload_objects(self.root / "render")
-        pdf_upload = api.return_value.sync_bucket.call_args_list[0]
-        self.assertIn("ocr-manifest.json", pdf_upload.kwargs["include"])
-        call = api.return_value.sync_bucket.call_args
-        self.assertTrue(call.args[1].endswith(str(Path(result["render_manifest"]["path"]).parent)))
-        self.assertNotEqual(call.args[1], stages.BUCKET)
+        self.assertEqual({bucket for bucket, _additions in uploads},
+                         {stages.shared.PDF_PAGES_BUCKET, stages.shared.PDF_OCR_INPUT_BUCKET})
+        pdf_upload = next(additions for bucket, additions in uploads if bucket == stages.shared.PDF_PAGES_BUCKET)
+        remote_paths = [remote for _local, remote in pdf_upload]
+        self.assertIn(result["render_manifest"]["path"], remote_paths)
+        self.assertNotEqual({remote.split("/", 1)[0] for remote in remote_paths}, {stages.BUCKET})
 
     def test_planner_includes_small_pdf_and_rebuilds_old_ocr_for_v2_index(self):
         item = {**self.item(), "source_bytes": 1024}
@@ -729,6 +757,14 @@ class PdfOcrStagesTests(unittest.TestCase):
         self.assertNotEqual(first["books"][0]["profile"], changed["books"][0]["profile"])
         self.assertNotEqual(stages.generation_for(first["books"][0]), stages.generation_for(changed["books"][0]))
         self.assertEqual(first["books"][0]["render_manifest"], changed["books"][0]["render_manifest"])
+
+    def test_identical_ready_ocr_publication_is_noop(self):
+        book = {"source_sha256": "a" * 64, "source_revision": "b" * 40,
+                "source_kind": "upstream", "profile": "ocr-profile", "page_count": 12,
+                "page_manifest": {"path": "pages/manifest.json", "sha256": "c" * 64, "bytes": 12}}
+        previous = {**book, "status": "ready"}
+        self.assertTrue(stages.ocr_publication_is_current(previous, book))
+        self.assertFalse(stages.ocr_publication_is_current(previous, {**book, "profile": "changed"}))
 
 
 if __name__ == "__main__":

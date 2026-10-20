@@ -21,6 +21,7 @@ KINDS = {
     "image": {"extensions": ("jpg", "jpeg", "png", "bmp", "tif", "tiff", "webp"), "sharded": True},
     "media": {"extensions": ("audio", "video", "swf"), "sharded": True},
     "ebook": {"extensions": ("epub", "mobi", "azw3", "fb2", "chm"), "sharded": True},
+    "office-chapters": {"extensions": ("doc", "docx", "odt", "rtf"), "sharded": False},
     "converted-ebook": {"extensions": ("mobi", "azw3", "fb2"), "sharded": False},
     "text": {"extensions": ("txt", "md", "markdown", "vcf", "ini"), "sharded": False},
     "office": {"extensions": ("doc", "docx", "odt", "rtf"), "sharded": False},
@@ -47,9 +48,11 @@ def read_json(fs: HfFileSystem, bucket: str, path: str) -> dict:
     try:
         with fs.open(f"hf://buckets/{bucket}/{path}", "rb") as stream:
             value = json.loads(stream.read().decode("utf-8"))
-        return value if isinstance(value, dict) else {}
-    except (FileNotFoundError, OSError, ValueError, json.JSONDecodeError):
+    except FileNotFoundError:
         return {}
+    if not isinstance(value, dict):
+        raise ValueError(f"invalid Reader stream index: {bucket}/{path}")
+    return value
 
 
 def source_extension(record: dict) -> str:
@@ -86,6 +89,10 @@ def root_for(kind: str, extension: str) -> str:
         return f"media/{extension}"
     if kind in {"ebook", "converted-ebook"}:
         return f"chapters/ebook/{extension}"
+    if kind == "office-chapters":
+        # Office sources are normalized to EPUB chapters, so all four source
+        # extensions share one canonical index and one GC-visible namespace.
+        return "chapters/ebook/epub"
     return {
         "text": "documents/text",
         "office": f"documents/office/{extension}",

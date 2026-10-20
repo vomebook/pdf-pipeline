@@ -38,6 +38,19 @@ class Store:
 
 
 class V3PublicationTests(unittest.TestCase):
+    def test_unified_snapshot_retains_all_formats_and_promotions_preserve_it(self):
+        base = {"v": 1, "f": {"ebook": {"s": 2, "m": "e", "p": "book.epub"},
+                              "media": {"s": 2, "m": "a", "p": "audio.mp3"}}}
+        packed = gzip.compress(publish.encode(base), mtime=0)
+        self.store.put_bytes(publish.ASSETS, "reader-index/reader_assets.json.gz", packed)
+        first = publish.unify(self.store, apply=True)
+        pointer, catalog = publish.current(self.store)
+        self.assertEqual(publish.pinned_base(self.store, catalog, {}), base)
+        staged = publish.stage(self.store, self.candidate(), self.bundle, apply=True)
+        publish.promote(self.store, staged["candidate"], first["generation"], apply=True)
+        self.assertEqual(publish.current(self.store)[1]["base_sidecar"], catalog["base_sidecar"])
+        self.assertTrue(publish.unify(self.store, apply=True)["unchanged"])
+
     def test_scoped_withdrawal_preserves_other_books_history_and_source_objects(self):
         first = publish.stage(self.store, self.candidate(), self.bundle, apply=True)
         one = publish.promote(self.store, first["candidate"], None, apply=True)
@@ -233,6 +246,30 @@ class V3PublicationTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             publish.acknowledge(self.store, "hf", {**accepted, "generation": "a" * 64}, apply=True)
 
+    def test_ack_all_reports_projection_timeout_without_failing_publication(self):
+        staged = publish.stage(self.store, self.candidate(), self.bundle, apply=True)
+        promoted = publish.promote(self.store, staged["candidate"], None, apply=True)
+        clock = [0]
+        accepted = {"generation": promoted["generation"], "surface": "hf", "applied": True,
+                    "acks": {"hf": True, "pages": False}}
+
+        def observe(_store, surface, _client):
+            if surface == "hf":
+                return {"version": 1, "surface": "hf", "active": True,
+                        "generation": promoted["generation"],
+                        "catalog_sha256": promoted["pointer"]["catalog"]["sha256"], "files": 1}
+            raise ValueError("Pages projection is still old")
+
+        with patch.object(publish, "observe_consumer", side_effect=observe), \
+                patch.object(publish, "acknowledge", return_value=accepted):
+            report = publish.acknowledge_all(
+                self.store, object(), apply=True, timeout_seconds=5,
+                sleep_fn=lambda seconds: clock.__setitem__(0, clock[0] + seconds),
+                clock=lambda: clock[0])
+        self.assertFalse(report["complete"])
+        self.assertEqual(report["pending"], ["pages"])
+        self.assertEqual(report["reason"], "consumer-projection-timeout")
+
     def test_live_acceptance_checks_actual_sidecar_not_status_alone(self):
         import gzip
         import httpx
@@ -280,10 +317,29 @@ class V3PublicationTests(unittest.TestCase):
         import yaml
         root = Path(__file__).resolve().parents[1]
         workflow = yaml.safe_load((root / ".github/workflows/reader-v3-publish.yml").read_text())
-        self.assertEqual(workflow["name"], "Publish v3 Reading Generation")
+        self.assertEqual(workflow["name"], "Reader/桶 · Publish v3 Reading Generation")
         self.assertEqual(workflow["concurrency"]["group"], "reader-sidecar")
         self.assertFalse(workflow["concurrency"]["cancel-in-progress"])
+        self.assertNotIn("workflow_run", workflow[True])
         self.assertFalse(workflow[True]["workflow_dispatch"]["inputs"]["apply"]["default"])
+        self.assertIn("retire-ocr-progress", workflow[True]["workflow_dispatch"]["inputs"]["operation"]["options"])
+        operation_step = next(step for step in workflow["jobs"]["publish"]["steps"]
+                              if step.get("id") == "operation")
+        self.assertIn("retire-ocr-progress)", operation_step["run"])
+        # Correction is suspended from automation: schedules admit OCR only.
+        script = next(step["run"] for step in workflow["jobs"]["publish"]["steps"]
+                      if step.get("id") == "operation")
+        self.assertIn("OPERATION=auto\n", script)
+        self.assertNotIn("OPERATION=correct", script)
+        self.assertNotIn("cycle", workflow[True]["workflow_dispatch"]["inputs"]["operation"]["options"])
+        ack_step = next(step for step in workflow["jobs"]["publish"]["steps"]
+                        if step.get("id") == "ack")
+        self.assertIn("operation == 'auto'", ack_step["if"])
+        self.assertIn("complete=", ack_step["run"])
+        self.assertIn("retire", workflow[True]["workflow_dispatch"]["inputs"]["operation"]["options"])
+        self.assertIn("retire|retire-ocr-progress)", operation_step["run"])
+        self.assertFalse(any(step.get("name", "").startswith("Retire acknowledged")
+                             for step in workflow["jobs"]["publish"]["steps"]))
         env = {"GITHUB_ACTIONS": "true", "GITHUB_REPOSITORY": "anftm/pipeline", "GITHUB_RUN_ID": "123",
                "GITHUB_WORKFLOW": workflow["name"], "READER_V3_WRITE_PROTOCOL": publish.PROTOCOL,
                "GITHUB_WORKFLOW_REF": "anftm/pipeline/.github/workflows/reader-v3-publish.yml@refs/heads/main"}
@@ -323,5 +379,144 @@ class V3PublicationTests(unittest.TestCase):
         self.assertEqual(report["components"]["text"], "ready")
         self.assertNotIn((publish.ASSETS, publish.POINTER), self.store.objects)
         publish.promote(self.store, report["candidate"], None, apply=True)
+
+    def preview_candidate(self, source="a" * 64, key="repo\0book.pdf"):
+        full = self.candidate(source, key)
+        manifest = v3.decode((self.bundle / full["path"]).read_bytes())
+        previews = [page for part in manifest["preview"]["partitions"]
+                    for page in v3.decode((self.bundle / part["resource"]["path"]).read_bytes())["pages"]]
+        spec = {"source_key": key, "source_sha256": source, "primary": manifest["primary"]["resource"],
+                "previews": previews, "require_complete_preview": True}
+        return v3.build_reading(spec, lambda ref: (self.bundle / ref["path"]).read_bytes(), self.bundle)[0]
+
+
+    def test_preview_can_publish_before_ocr_and_later_fill_text_without_rerender(self):
+        preview = self.preview_candidate()
+        staged = publish.stage(self.store, preview, self.bundle, apply=True)
+        first = publish.promote(self.store, staged["candidate"], None, apply=True)
+        before = v3.verify_reading(preview, lambda ref: self.store.read_bytes(ref["bucket"], ref["path"]))
+        self.assertIsNone(before["text_layer"])
+        self.assertEqual(before["components"]["text"], "pending")
+        self.assertEqual(before["components"]["preview"], "ready")
+        # The independently built text bundle uses exactly the existing page
+        # resources. No image/SVG generation is needed for this later upgrade.
+        full = self.candidate()
+        full_manifest = v3.decode((self.bundle / full["path"]).read_bytes())
+        ocr = {"source_sha256": "a" * 64, "page_count": 1, "text_layer": full_manifest["text_layer"]}
+        raw = publish.encode(ocr)
+        ocr_ref = publish.metadata(v3.shared.PDF_PAGES_BUCKET,
+                                  "objects/aa/" + "a" * 64 + "/" + "e" * 16 + "/ocr-manifest.json", raw, "provenance")
+        self.store.put_bytes(ocr_ref["bucket"], ocr_ref["path"], raw)
+        # Publish already-built text resources as an OCR assembler would.
+        publish.stage(self.store, full, self.bundle, apply=True)
+        spec = {"source_key": "repo\0book.pdf", "source_sha256": "a" * 64,
+                "primary": before["primary"]["resource"], "ocr_manifest": ocr_ref,
+                "reuse_reading": preview, "vector_previews": True}
+        with patch.object(v3, "generate_previews", side_effect=AssertionError("must reuse previews")):
+            upgraded = publish.build_stage(self.store, spec, self.bundle / "text-upgrade", apply=True)
+        publish.promote(self.store, upgraded["candidate"], first["generation"], apply=True)
+        active = publish.current(self.store)[1]["files"]["repo\0book.pdf"]
+        after = v3.verify_reading(active["resource"], lambda ref: self.store.read_bytes(ref["bucket"], ref["path"]))
+        self.assertEqual(after["text_layer"], full_manifest["text_layer"])
+        self.assertEqual(after["components"]["text"], "ready")
+        with self.assertRaisesRegex(ValueError, "preview-only publication cannot replace"):
+            publish.promote(self.store, staged["candidate"], publish.current(self.store)[0]["generation"], apply=True)
+
+
+    def test_preview_only_builder_never_requires_or_reads_ocr(self):
+        ref = self.candidate()
+        manifest = v3.decode((self.bundle / ref["path"]).read_bytes())
+        primary = manifest["primary"]["resource"]
+        self.store.put_bytes(primary["bucket"], primary["path"], (self.bundle / primary["path"]).read_bytes())
+        spec = {"source_key": "repo\0book.pdf", "source_sha256": "a" * 64,
+                "primary": primary, "preview_only": True, "vector_previews": True}
+        with patch.object(v3, "backfill_text", side_effect=AssertionError("must not require OCR")), \
+                patch.object(publish, "native_ocr", side_effect=AssertionError("must not extract text")):
+            result = publish.build_stage(self.store, spec, self.bundle / "preview-only", apply=True)
+        self.assertEqual(result["components"]["preview"], "ready")
+        self.assertEqual(result["components"]["text"], "pending")
+
+
+    def test_preview_only_catalog_and_inflight_task_keep_gc_reference_closure(self):
+        from tests.test_reader_gc_graph import MemoryStore
+        from scripts.reader_gc_graph import ReferenceGraph
+        preview = self.preview_candidate()
+        staged = publish.stage(self.store, preview, self.bundle, apply=True)
+        publish.promote(self.store, staged["candidate"], None, apply=True)
+        store = MemoryStore()
+        for (bucket, path), raw in self.store.objects.items():
+            store.objects[bucket][path] = raw
+        report = ReferenceGraph(store).build()
+        self.assertTrue(report["graph_complete"], report["blockers"])
+        self.assertTrue(all(not value["candidates"] for value in report["buckets"].values()))
+
+
+    def test_text_upgrade_cannot_silently_change_existing_preview_resources(self):
+        preview = self.preview_candidate()
+        staged = publish.stage(self.store, preview, self.bundle, apply=True)
+        first = publish.promote(self.store, staged["candidate"], None, apply=True)
+        altered = publish.stage(self.store, self.candidate(label="Different preview prefix"), self.bundle, apply=True)
+        with self.assertRaisesRegex(ValueError, "preserve the complete existing preview"):
+            publish.promote(self.store, altered["candidate"], first["generation"], apply=True)
+        self.assertEqual(publish.current(self.store)[0]["generation"], first["generation"])
+
+
+    def test_candidate_read_cache_is_bounded_and_fresh_readback_detects_mutation(self):
+        raw = b"12345"
+        ref = publish.metadata(v3.shared.PDF_PAGES_BUCKET,
+                               "objects/aa/" + "a" * 64 + "/" + "b" * 16 + "/preview/page-000001.png", raw)
+        self.store.put_bytes(ref["bucket"], ref["path"], raw)
+        reader = publish.CandidateReader(self.store, cache_bytes=5)
+        with patch.object(self.store, "read_bytes", wraps=self.store.read_bytes) as read:
+            self.assertEqual(reader(ref), raw)
+            self.assertEqual(reader(ref), raw)
+            self.assertEqual(read.call_count, 1)
+        other = {**ref, "path": ref["path"].replace("000001", "000002")}
+        self.store.put_bytes(other["bucket"], other["path"], raw)
+        reader(other)
+        self.assertEqual(reader.cached_bytes, 5)
+        self.assertEqual(len(reader.cache), 1)
+        self.store.put_bytes(ref["bucket"], ref["path"], b"bad")
+        fresh = publish.CandidateReader(self.store)
+        with self.assertRaisesRegex(ValueError, "checksum mismatch"):
+            fresh(ref)
+        reader.close()
+        fresh.close()
+
+
+    def test_batch_upload_still_requires_independent_complete_remote_readback(self):
+        ref = self.candidate()
+        batches = []
+        def upload(bucket, additions):
+            batches.append(list(additions))
+            for local, path in additions:
+                self.store.put_bytes(bucket, path, Path(local).read_bytes())
+        self.store.put_files = upload
+        report = publish.stage(self.store, ref, self.bundle, apply=True)
+        self.assertTrue(report["applied"])
+        self.assertEqual(len(batches), 1)
+        self.assertGreater(len(batches[0]), 1)
+        # A new candidate with an upload that corrupts any one preview must fail
+        # before a candidate record/catalog can be promoted.
+        ref2 = self.candidate("b" * 64, "repo\0second.pdf")
+        def corrupt(bucket, additions):
+            for local, path in additions:
+                raw = b"bad" if path.endswith(".png") else Path(local).read_bytes()
+                self.store.put_bytes(bucket, path, raw)
+        self.store.put_files = corrupt
+        with self.assertRaises(ValueError):
+            publish.stage(self.store, ref2, self.bundle, apply=True)
+        self.assertNotIn((publish.ASSETS, publish.POINTER), self.store.objects)
+
+    def test_preview_promotion_refuses_a_newly_completed_ocr_route(self):
+        preview = self.preview_candidate()
+        staged = publish.stage(self.store, preview, self.bundle, apply=True)
+        self.store.put_bytes(publish.ASSETS, "reader-index/pdf_ocr_manifest.json", publish.encode(
+            {"version": 1, "files": {"repo\0book.pdf": {"status": "ready", "ocr_manifest": "retained"}}}))
+        with self.assertRaisesRegex(ValueError, "cannot hide already available OCR"):
+            publish.promote(self.store, staged["candidate"], None, apply=True)
+        self.assertNotIn((publish.ASSETS, publish.POINTER), self.store.objects)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -14,13 +14,18 @@ from huggingface_hub import HfFileSystem, batch_bucket_files
 
 try:
     from . import shared
+    from . import reader_lifecycle
+    from .reader_bucket import publish_catalog, publish_json, read_json as read_bucket_json
 except ImportError:
     import shared
+    import reader_lifecycle
+    from reader_bucket import publish_catalog, publish_json, read_json as read_bucket_json
 
 
 ASSETS_BUCKET = "vomebook/reader-assets-v2"
 PDF_BUCKET = "vomebook/pdf-pages-v2"
 SIDECAR_PATH = "reader-index/reader_assets.json.gz"
+EBOOK_EXTENSIONS = ("epub", "mobi", "azw3", "fb2", "chm")
 
 
 def arguments():
@@ -73,6 +78,22 @@ def add_pdf_streams(files: dict, payload: dict, bucket: str) -> None:
         path = page_manifest.get("path") if isinstance(page_manifest, dict) else ""
         if isinstance(path, str) and path.endswith("/page-manifest.json"):
             files[key] = {**files.get(key, {}), **shared.pdf_pages_sidecar_entry(path, entry, files.get(key)), "b": bucket}
+
+
+def release_processing_roots(indexes: list[dict], generation: str, read, publish) -> int:
+    """Release only newly handed-off roots; retained released roots are read-only."""
+    results = [entry for payload in indexes for entry in payload.get("files", [])
+               if isinstance(entry, dict)]
+    updates = reader_lifecycle.processing_handoffs(results, generation, read)
+    for path, record in updates.items():
+        publish(path, record)
+    return len(updates)
+
+
+def ebook_chapter_indexes(assets_bucket: str) -> list[tuple[str, str]]:
+    """Return every canonical ebook chapter index that can own upload roots."""
+    return [(assets_bucket, f"chapters/ebook/{extension}/index.json")
+            for extension in EBOOK_EXTENSIONS]
 
 
 def build(fs: HfFileSystem, assets_bucket: str, pdf_bucket: str, derived_path: str,
@@ -159,7 +180,23 @@ def main() -> int:
     print(f"mappings={len(index['f'])} bytes={len(payload)} output={args.output}")
     if args.apply:
         batch_bucket_files(args.assets_bucket, add=[(str(args.output), SIDECAR_PATH)], token=token)
-        print(f"published={args.assets_bucket}/{SIDECAR_PATH}")
+        generation = publish_catalog(index, token)
+        # Conversion workers upload immutable bundles under a processing root
+        # before any index can reference them. The canonical sidecar/catalog
+        # is the handoff boundary; only then may those roots be released.
+        indexes = []
+        for bucket, path in [(args.pdf_bucket, args.derived_manifest),
+                             (args.assets_bucket, "documents/text/index.json"),
+                             *ebook_chapter_indexes(args.assets_bucket)]:
+            try:
+                payload = read_bucket_json(path, token, bucket=bucket)
+            except (FileNotFoundError, OSError, ValueError):
+                continue
+            indexes.append(payload)
+        released = release_processing_roots(
+            indexes, generation, lambda path: read_bucket_json(path, token),
+            lambda path, record: publish_json(path, record, token))
+        print(f"published={args.assets_bucket}/{SIDECAR_PATH} catalog={generation} released_roots={released}")
     else:
         print("report-only; pass --apply to publish")
     return 0

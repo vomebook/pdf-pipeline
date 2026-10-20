@@ -5,10 +5,15 @@ from __future__ import annotations
 
 import argparse
 import bisect
+import functools
 import gzip
 import hashlib
 import json
 import posixpath
+import re
+import threading
+import time
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from collections import Counter
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -16,18 +21,30 @@ from pathlib import Path
 try:
     from .reader_bucket_store import HubBucketStore, S3BucketStore
     from .shared import READER_ASSETS_BUCKET, PDF_PAGES_BUCKET, PDF_OCR_INPUT_BUCKET
-    from . import reader_lifecycle
+    from . import reader_lifecycle, ccrd_lifecycle
+    from .reader_gc_stream import catalog_json
 except ImportError:
     from reader_bucket_store import HubBucketStore, S3BucketStore
     from shared import READER_ASSETS_BUCKET, PDF_PAGES_BUCKET, PDF_OCR_INPUT_BUCKET
     import reader_lifecycle
+    import ccrd_lifecycle
+    from reader_gc_stream import catalog_json
 
 
-BUCKETS = (READER_ASSETS_BUCKET, PDF_PAGES_BUCKET, PDF_OCR_INPUT_BUCKET)
+READER_BUCKETS = (READER_ASSETS_BUCKET, PDF_PAGES_BUCKET, PDF_OCR_INPUT_BUCKET)
+BUCKETS = (*READER_BUCKETS, ccrd_lifecycle.BUCKET)
+CATALOG_REF = (READER_ASSETS_BUCKET, "reader-index/reader_catalog.json")
+RETIREMENT_REF = (READER_ASSETS_BUCKET, "reader-index/v3/retirement.json")
+ACKED = {"hf": True, "pages": True}
 MANAGED_PREFIXES = (
     "objects/", "ebook-chapters/", "staging/", "pages/", "documents/",
     "chapters/", "media/", "native/", "derived/",
+    "reader-index/snapshots/",
 )
+# Run journals are the audit trail of the collector itself, mirrored as Actions
+# artifacts. Control receipts are small point-in-time records. They are
+# deliberately retained even though no root references them.
+RETAINED_PREFIXES = ("reader-index/gc/", "reader-index/reader_gc_acknowledgments.json")
 PATH_FIELDS = {
     "path", "paths", "object", "fallback", "manifest", "manifest_path", "root",
     "new_path", "reader_assets_path", "ocr_manifest", "p", "o", "i", "w", "j",
@@ -48,9 +65,16 @@ MANIFEST_KINDS = {
 }
 
 
-def is_root(path: str) -> bool:
+def managed_prefixes(bucket: str) -> tuple[str, ...]:
+    return ccrd_lifecycle.MANAGED_PREFIXES if bucket == ccrd_lifecycle.BUCKET else MANAGED_PREFIXES
+
+
+def is_root(path: str, bucket: str | None = None) -> bool:
+    if bucket == ccrd_lifecycle.BUCKET:
+        return ccrd_lifecycle.is_root(path)
     name = posixpath.basename(path)
-    if path.startswith("reader-index/generations/"):
+    if path.startswith((
+            "reader-index/generations/", "reader-index/snapshots/") + RETAINED_PREFIXES):
         return False
     return (path.startswith("reader-index/") and path.endswith((".json", ".json.gz"))) or (
         name == "index.json" or name.startswith("index-") and name.endswith(".json"))
@@ -69,7 +93,9 @@ def decode(raw: bytes) -> dict:
 
 
 class ReferenceGraph:
-    def __init__(self, store, include_input: bool = True, generation_grace_days: int = 30):
+    def __init__(self, store, include_input: bool = True, generation_grace_days: int = 0,
+                 progress=None, workers: int = 8, max_rounds: int = 20, full_passes: int = 3,
+                 deadline: float | None = None):
         self.store = store
         self.include_input = include_input
         self.files = {}
@@ -84,20 +110,113 @@ class ReferenceGraph:
         self.trees = set()
         self.generation_grace_days = generation_grace_days
         self.catalog = {}
+        self.retired_roots = set()
+        self.retired_inputs = set()
+        self.progress = progress or (lambda *args, **kwargs: None)
+        self.workers = max(1, workers)
+        self.max_rounds = max(1, max_rounds)
+        self.full_passes = max(1, full_passes)
+        self.deadline = deadline
+        self.started = time.monotonic()
+        self.lock = threading.Lock()
+        self.origin = None
+        # Per-origin facts are replaced whenever that origin is re-read, so a
+        # root that changes during the scan is judged by its latest version.
+        self.direct = {}
+        self.handoffs = {}
+        self.unreadable = {}
+        self.failures = Counter()
+        self.deferred = set()
+        self.catalog_ids = set()
+        self.retired_acked = set()
+        self.fingerprints = {}
+        self.root_names = {}
+        self.expected_resources = {}
+        self.loaded_digests = {}
+        self.external_pins = set()
+        self.externally_traversed = set()
+        self.active_external_pin = False
+
+    def read_catalog(self, ref):
+        parser = functools.partial(catalog_json, grace_days=self.generation_grace_days)
+        if hasattr(self.store, "read_graph_json"):
+            return self.store.read_graph_json(*ref, parser=parser)
+        raw = self.store.read_bytes(*ref)
+        return parser([raw], raw.startswith(b"\x1f\x8b"))
 
     def load(self, ref: tuple[str, str]) -> dict | None:
         try:
-            raw = self.store.read_bytes(*ref)
-            payload = decode(raw)
-            if is_root(ref[1]):
-                self.root_hashes[ref] = hashlib.sha256(raw).hexdigest()
-            return payload
+            if ref == CATALOG_REF:
+                payload, digest = self.read_catalog(ref)
+            elif hasattr(self.store, "read_graph_json"):
+                payload, digest = self.store.read_graph_json(*ref)
+            else:
+                raw = self.store.read_bytes(*ref)
+                payload, digest = decode(raw), hashlib.sha256(raw).hexdigest()
         except Exception as error:
             # A permissions/transport failure must never resemble an empty root.
-            self.blockers.add(f"unreadable JSON: {ref[0]}:{ref[1]} ({type(error).__name__})")
+            status = getattr(getattr(error, "response", None), "status_code", None)
+            detail = f" HTTP {status}" if status else ""
+            with self.lock:
+                self.unreadable[ref] = f"unreadable JSON: {ref[0]}:{ref[1]} ({type(error).__name__}{detail})"
+                self.failures[ref] += 1
             return None
+        with self.lock:
+            self.unreadable.pop(ref, None)
+            self.loaded_digests[ref] = digest
+            if is_root(ref[1], ref[0]):
+                self.root_hashes[ref] = digest
+                etag = getattr(self.store, "read_etags", {}).get(ref)
+                self.fingerprints[ref] = ("etag", etag) if etag else ("sha256", digest)
+        return payload
 
-    def mark(self, bucket: str, path: str, *, tree: bool = False):
+    def handoff_resolved(self, generation) -> bool:
+        return isinstance(generation, str) and (
+            generation in self.catalog_ids or generation in self.retired_acked)
+
+    def merge_catalog(self, payload: dict):
+        self.catalog = payload
+        self.catalog_ids.update(name for name in payload.get("generations", {}) if isinstance(name, str))
+        for name, entry in (payload.get("retired_generations") or {}).items():
+            if (isinstance(entry, dict) and entry.get("replacement_generation")
+                    and entry.get("replacement_acks") == ACKED):
+                self.retired_acked.add(name)
+
+    def merge_retirement(self, state: dict):
+        for path, item in state.get("retired_inputs", {}).items():
+            if (not re.fullmatch(r"objects/[0-9a-f]{2}/[0-9a-f]{64}/[0-9a-f]{16}/ocr-input/page-[0-9]{6}\.png", path)
+                    or not isinstance(item, dict) or item.get("path") != path
+                    or item.get("bucket") != PDF_OCR_INPUT_BUCKET or item.get("source_sha256") != path.split("/")[2]):
+                self.blockers.add("invalid retired OCR input identity")
+            else:
+                self.retired_inputs.add((PDF_OCR_INPUT_BUCKET, path))
+        for path in state["retired_paths"]:
+            if not isinstance(path, str) or not re.fullmatch(
+                    r"reader-index/(?:v3/(?:promotions/[0-9a-f]{64}\.json|generations/[0-9a-f]{64}/catalog\.json|candidates/[0-9a-f]{64}\.json)|processing/(?:v3|djvu|office-chapters)-[0-9a-f]{32}\.json)", path):
+                self.blockers.add("invalid retired root path")
+            else:
+                self.retired_roots.add((READER_ASSETS_BUCKET, path))
+
+    def process(self, ref, payload):
+        self.origin = ref
+        self.active_external_pin = ref in self.external_pins
+        if self.active_external_pin:
+            self.externally_traversed.add(ref)
+        self.direct[ref] = set()
+        self.handoffs.pop(ref, None)
+        try:
+            if not self.validate(payload, *ref):
+                return
+            if ref == CATALOG_REF:
+                self.merge_catalog(payload)
+            elif ref == RETIREMENT_REF:
+                self.merge_retirement(payload)
+            self.walk(payload, *ref)
+        finally:
+            self.origin = None
+            self.active_external_pin = False
+
+    def mark(self, bucket: str, path: str, *, tree: bool = False, external_pin: bool = False):
         if bucket not in BUCKETS:
             self.blockers.add(f"unsupported reference bucket: {bucket}")
             return
@@ -106,15 +225,29 @@ class ReferenceGraph:
             self.blockers.add(f"invalid object path: {bucket}:{path}")
             return
         ref = (bucket, path)
+        if external_pin or self.active_external_pin:
+            self.external_pins.add(ref)
+        if ref in self.retired_inputs and ref not in self.external_pins and not tree:
+            return
         self.references.add(ref)
+        if not tree and self.origin is not None:
+            self.direct.setdefault(self.origin, set()).add(ref)
         if bucket not in self.files:
             self.blockers.add(f"referenced bucket was not inventoried: {bucket}")
             return
         if path not in self.files[bucket] and not tree:
-            self.missing.add(ref)
+            # Judged against the final inventory; may also appear later.
+            self.deferred.add(ref)
             return
-        if is_manifest(path) and ref not in self.seen:
+        graph_document = (ccrd_lifecycle.is_document(path) if bucket == ccrd_lifecycle.BUCKET else
+                          is_manifest(path) or is_root(path) or path.startswith("reader-index/snapshots/"))
+        if graph_document and ref not in self.seen:
             self.pending.add(ref)
+        elif graph_document and ref in self.external_pins and ref not in self.externally_traversed:
+            self.seen.discard(ref)
+            self.pending.add(ref)
+        if bucket == ccrd_lifecycle.BUCKET:
+            return
         # HTML/CSS/XHTML, fonts, media companions and manifest siblings are an
         # immutable bundle. Keep the whole bundle instead of parsing markup.
         root = path if tree else posixpath.dirname(path)
@@ -129,6 +262,8 @@ class ReferenceGraph:
             for child in ordered[start:end]:
                 child_ref = (bucket, child)
                 self.references.add(child_ref)
+                if self.active_external_pin or external_pin:
+                    self.external_pins.add(child_ref)
                 if is_manifest(child) and child_ref not in self.seen:
                     self.pending.add(child_ref)
 
@@ -159,7 +294,38 @@ class ReferenceGraph:
             self.mark(bucket, posixpath.join(posixpath.dirname(origin), value), tree=field == "root")
 
     def walk(self, value, bucket: str, origin: str, explicit: bool = False, field: str = ""):
+        if bucket == ccrd_lifecycle.BUCKET and not field:
+            for ref in ccrd_lifecycle.references(value, origin):
+                key = ref['bucket'], ref['path']
+                previous = self.expected_resources.get(key)
+                if previous and (previous['sha256'], previous['bytes']) != (ref['sha256'], ref['bytes']):
+                    self.blockers.add(f"conflicting retained resource identity: {key[0]}:{key[1]}")
+                    continue
+                self.expected_resources[key] = ref
+                if key in self.loaded_digests and self.loaded_digests[key] != ref['sha256']:
+                    self.blockers.add(f"retained resource checksum mismatch: {key[0]}:{key[1]}")
+                self.mark(*key, external_pin=True)
+            return
         if isinstance(value, dict):
+            if value.get("kind") == "reader-v3-retirement":
+                self.walk(value.get("resources", []), bucket, origin, explicit, "resources")
+                return
+            if value.get("kind") == "reader-v3-automation":
+                for task in value.get("tasks", {}).values():
+                    candidate = task.get("candidate") or {}
+                    if task.get("status") == "published" and (candidate.get("bucket"), candidate.get("path")) in self.retired_roots:
+                        continue
+                    task = dict(task)
+                    spec = dict(task.get("spec") or {})
+                    if spec.get("primary_source"):
+                        planned = spec.pop("primary", None)
+                        if isinstance(planned, dict):
+                            target = (planned.get("bucket"), planned.get("path"))
+                            if target[1] in self.files.get(target[0], set()):
+                                self.walk(planned, bucket, origin, explicit, "primary")
+                    task["spec"] = spec
+                    self.walk(task, bucket, origin, explicit, "task")
+                return
             if origin.endswith("reader_catalog.json") and value.get("kind") == "reader-catalog":
                 current = (value.get("current") or {}).get("generation")
                 for generation in (value.get("generations") or {}).values():
@@ -169,10 +335,14 @@ class ReferenceGraph:
                 return
             if origin.startswith("reader-index/processing/") and value.get("status") == "released":
                 generation = value.get("generation")
-                if isinstance(generation, str) and generation in self.catalog.get("generations", {}):
+                if self.handoff_resolved(generation):
                     return
-                self.blockers.add(f"released root lacks catalog handoff: {bucket}:{origin}")
+                # Resolve against every catalog version read during the scan;
+                # until then the root's resources stay protected.
+                self.handoffs[self.origin or (bucket, origin)] = generation
             context = value.get("bucket")
+            if value.get("role") == "review" and (context, value.get("path")) in self.retired_inputs:
+                self.blockers.add(f"retired input still has open review evidence: {context}:{value.get('path')}")
             if context is not None:
                 if not isinstance(context, str) or context not in BUCKETS:
                     self.blockers.add(f"invalid bucket in {bucket}:{origin}")
@@ -210,8 +380,60 @@ class ReferenceGraph:
             self.path(value, bucket, origin, explicit, field)
 
     def validate(self, payload: dict, bucket: str, path: str) -> bool:
-        if is_root(path):
-            if payload.get("kind") in {"reader-v3-automation", "reader-v3-correction-state"}:
+        ref = (bucket, path)
+        expected = self.expected_resources.get(ref)
+        if expected and self.loaded_digests.get(ref) != expected['sha256']:
+            self.blockers.add(f"retained resource checksum mismatch: {bucket}:{path}")
+            return False
+        if bucket == ccrd_lifecycle.BUCKET:
+            try:
+                ccrd_lifecycle.references(payload, path)
+            except (ValueError, KeyError, TypeError) as error:
+                self.blockers.add(f"invalid CCRD lifecycle schema: {path} ({type(error).__name__})")
+                return False
+            return True
+        if is_root(path, bucket):
+            if payload.get("kind") == "reader-v3-retirement":
+                if (payload.get("version") != 1 or payload.get("replacement_acks") != {"hf": True, "pages": True}
+                        or not isinstance(payload.get("resources"), list)
+                        or not isinstance(payload.get("retired_paths"), list)):
+                    self.blockers.add(f"invalid retirement state: {bucket}:{path}")
+                    return False
+            elif payload.get("kind") == "reader-gc-acknowledgments":
+                if (payload.get("version") != 1
+                        or not isinstance(payload.get("current"), dict)
+                        or not isinstance(payload["current"].get("generation"), str)
+                        or not isinstance(payload["current"].get("catalog_sha256"), str)):
+                    self.blockers.add(f"invalid GC acknowledgment: {bucket}:{path}")
+                    return False
+            elif payload.get("kind") == "pdf-ocr-progress-index":
+                books = payload.get("books")
+                migrated = payload.get("migrated_from")
+                if (payload.get("version") != 1 or not isinstance(books, dict)
+                        or any(not isinstance(key, str) or not isinstance(item, dict)
+                               or not isinstance(item.get("generation"), str)
+                               or not isinstance(item.get("pages"), list)
+                               or any(type(page) is not int or page < 1 for page in item["pages"])
+                               for key, item in books.items())
+                        or (migrated is not None and (not isinstance(migrated, dict)
+                            or migrated.get("path") != "reader-index/pdf_ocr_progress.json"
+                            or type(migrated.get("bytes")) is not int or migrated["bytes"] <= 0
+                            or not re.fullmatch(r"[0-9a-f]{64}", str(migrated.get("sha256", "")))))):
+                    self.blockers.add(f"invalid PDF OCR progress index: {bucket}:{path}")
+                    return False
+            elif payload.get("kind") == "pdf-ocr-progress-book":
+                files = payload.get("files")
+                key = payload.get("key")
+                entry = files.get(key) if isinstance(files, dict) and isinstance(key, str) else None
+                if (payload.get("version") != 1 or not isinstance(key, str) or not key
+                        or not isinstance(files, dict) or set(files) != {key}
+                        or not isinstance(entry, dict) or not isinstance(entry.get("generation"), str)
+                        or not isinstance(entry.get("pages"), dict)
+                        or any(not isinstance(page, dict) or str(page.get("p")) != number
+                               for number, page in entry["pages"].items())):
+                    self.blockers.add(f"invalid PDF OCR progress shard: {bucket}:{path}")
+                    return False
+            elif payload.get("kind") in {"reader-v3-automation", "reader-v3-correction-state"}:
                 if (payload.get("version") != 1 or not isinstance(payload.get("tasks"), dict)
                         or not isinstance(payload.get("days"), dict)
                         or any(not isinstance(task, dict) for task in payload["tasks"].values())):
@@ -294,62 +516,241 @@ class ReferenceGraph:
                         self.mark(bucket, f"{root}/pages/page-{number:06d}.webp")
         return True
 
+    def inventory(self, bucket):
+        self.progress("inventory", bucket=bucket)
+        files = self.store.list_files(bucket, ("",))
+        self.progress("inventory-complete", bucket=bucket, objects=len(files))
+        return files
+
+    def set_inventory(self, bucket, files):
+        self.files[bucket] = files
+        self.ordered[bucket] = sorted(files)
+        self.root_names[bucket] = {path for path in files if is_root(path, bucket)}
+
+    def drain(self, pool):
+        # Keep every reader busy: one slow object must not stall a whole batch.
+        inflight, checked = {}, 0
+        while True:
+            while self.pending and len(inflight) < self.workers * 2:
+                ref = self.pending.pop()
+                if ref in self.seen:
+                    continue
+                self.seen.add(ref)
+                inflight[pool.submit(self.load, ref)] = ref
+            if not inflight:
+                return
+            if self.deadline is not None and time.monotonic() > self.deadline:
+                for future in inflight:
+                    future.cancel()
+                self.pending.update(inflight.values())
+                raise TimeoutError("GC scan deadline reached")
+            done, _ = wait(inflight, timeout=30, return_when=FIRST_COMPLETED)
+            for future in done:
+                ref = inflight.pop(future)
+                payload = future.result()
+                if payload is not None:
+                    self.process(ref, payload)
+                checked += 1
+                if checked % 1024 == 0:
+                    print(f"GC graph: checked {len(self.seen)} roots/manifests; {len(self.pending)} pending; "
+                          f"{time.monotonic() - self.started:.0f}s", flush=True)
+                    self.progress("reference-traversal", checked=len(self.seen), pending=len(self.pending))
+
+    def changed(self, ref) -> bool:
+        recorded = self.fingerprints.get(ref)
+        if recorded is None:
+            return True
+        listed = getattr(self.store, "root_etags", {}).get(ref[0], {})
+        if recorded[0] == "etag" and ref[1] in listed:
+            return listed[ref[1]] != recorded[1]
+        try:
+            actual = self.store.digest(*ref) if hasattr(self.store, "digest") else (
+                hashlib.sha256(self.store.read_bytes(*ref)).hexdigest())
+        except FileNotFoundError:
+            return True
+        except Exception as error:
+            self.unreadable[ref] = f"root recheck failed: {ref[0]}:{ref[1]} ({type(error).__name__})"
+            self.failures[ref] += 1
+            return False
+        return actual != self.root_hashes.get(ref)
+
+    def protect_additions(self, bucket, added):
+        for path in added:
+            parent = posixpath.dirname(path)
+            while parent:
+                if (bucket, parent) in self.trees:
+                    ref = (bucket, path)
+                    self.references.add(ref)
+                    if is_manifest(path) and ref not in self.seen:
+                        self.pending.add(ref)
+                    break
+                parent = posixpath.dirname(parent)
+
+    def list_roots(self, bucket):
+        if bucket == ccrd_lifecycle.BUCKET:
+            return {path for path in self.store.list_files(bucket, ("",)) if is_root(path, bucket)}
+        if hasattr(self.store, "list_roots"):
+            parents = {posixpath.dirname(path) + "/" for path in self.root_names.get(bucket, set())
+                       if not path.startswith("reader-index/") and "/" in path}
+            return set(self.store.list_roots(bucket, parents))
+        return {path for path in self.store.list_files(bucket, ("",)) if is_root(path, bucket)}
+
+    def root_round(self, pool, round_number) -> bool:
+        """Read every listed root at its current version; True when nothing changed."""
+        self.drain(pool)
+        work = set()
+        for bucket in tuple(self.files):
+            self.progress("root-inventory-recheck", bucket=bucket, round=round_number)
+            roots = self.list_roots(bucket)
+            self.root_names[bucket] = roots
+            for path in sorted(roots):
+                ref = (bucket, path)
+                if ref in self.retired_roots:
+                    continue
+                if ref not in self.seen:
+                    work.add(ref)
+                    self.references.add(ref)
+                elif ref not in self.unreadable and self.changed(ref):
+                    work.add(ref)
+        work.update(ref for ref in self.unreadable if self.failures[ref] < 3
+                    and (ref[1] in self.root_names.get(ref[0], set())
+                         or ref[1] in self.files.get(ref[0], set())))
+        self.progress("root-content-recheck", roots=len(self.root_hashes), changed=len(work),
+                      round=round_number)
+        if not work and not self.pending:
+            return True
+        print(f"GC graph: round {round_number} re-reading {len(work)} new or changed roots; "
+              f"{time.monotonic() - self.started:.0f}s", flush=True)
+        self.seen.difference_update(work)
+        self.pending.update(work)
+        return False
+
+    def full_pass(self) -> bool:
+        """Refresh object existence; True unless it revealed roots in new locations."""
+        new_roots = False
+        for bucket in tuple(self.files):
+            self.progress("inventory-refresh", bucket=bucket)
+            latest = self.store.list_files(bucket, ("",))
+            previous, known = self.files[bucket], self.root_names.get(bucket, set())
+            self.files[bucket] = latest
+            self.ordered[bucket] = sorted(latest)
+            self.protect_additions(bucket, latest - previous)
+            roots = {path for path in latest if is_root(path, bucket)}
+            new_roots |= bool(roots - known)
+            self.root_names[bucket] = known | roots
+        for ref in list(self.deferred):
+            if ref[1] in self.files.get(ref[0], set()):
+                self.deferred.discard(ref)
+                previous, self.origin = self.origin, None
+                self.mark(*ref)
+                self.origin = previous
+        return not new_roots and not self.pending
+
+    def converge(self, pool) -> bool:
+        """Converge on roots with cheap root-only listings, then confirm with a full inventory."""
+        rounds = 0
+        for _ in range(self.full_passes):
+            while True:
+                rounds += 1
+                if rounds > self.max_rounds:
+                    return False
+                try:
+                    if self.root_round(pool, rounds):
+                        break
+                except TimeoutError:
+                    raise
+                except Exception as error:
+                    self.blockers.add(f"root inventory recheck failed ({type(error).__name__})")
+                    return True
+            try:
+                if self.full_pass():
+                    return True
+            except Exception as error:
+                self.blockers.add(f"root inventory recheck failed ({type(error).__name__})")
+                return True
+        return False
+
+    def finalize(self):
+        def alive(ref):
+            if ref in self.retired_roots and ref not in self.external_pins:
+                return False
+            if is_root(ref[1], ref[0]):
+                return ref[1] in self.root_names.get(ref[0], set())
+            return ref[1] in self.files.get(ref[0], set())
+        self.missing = {ref for origin, refs in self.direct.items() if alive(origin)
+                        for ref in refs if (ref not in self.retired_inputs or ref in self.external_pins)
+                        and ref[0] in self.files and ref[1] not in self.files[ref[0]]}
+        for ref, message in self.unreadable.items():
+            if alive(ref):
+                self.blockers.add(message)
+        for ref, generation in self.handoffs.items():
+            if alive(ref) and not self.handoff_resolved(generation):
+                self.blockers.add(f"released root lacks catalog handoff: {ref[0]}:{ref[1]}")
+
     def build(self) -> dict:
         if not self.include_input:
             self.blockers.add("input bucket inventory was explicitly skipped")
+        try:
+            self.store.root_predicate = is_root
+        except AttributeError:
+            pass
         for bucket in BUCKETS:
             if bucket == PDF_OCR_INPUT_BUCKET and not self.include_input:
                 continue
             try:
-                self.files[bucket] = self.store.list_files(bucket, ("",))
-                self.ordered[bucket] = sorted(self.files[bucket])
+                self.set_inventory(bucket, self.inventory(bucket))
+                print(f"GC graph: inventory {bucket} objects={len(self.files[bucket])}; "
+                      f"{time.monotonic() - self.started:.0f}s", flush=True)
             except Exception as error:
                 self.blockers.add(f"inventory unavailable: {bucket} ({type(error).__name__})")
         required = (READER_ASSETS_BUCKET, "reader-index/reader_assets.json.gz")
         if required[1] not in self.files.get(required[0], set()):
             self.blockers.add("canonical Reader sidecar is missing")
-        catalog_ref = (READER_ASSETS_BUCKET, "reader-index/reader_catalog.json")
-        if catalog_ref[1] in self.files.get(catalog_ref[0], set()):
-            self.catalog = self.load(catalog_ref) or {}
-        for bucket, files in self.files.items():
-            for path in sorted(files):
-                if is_root(path):
-                    ref = (bucket, path)
+        with ThreadPoolExecutor(max_workers=self.workers) as pool:
+            # The catalog and retirement journal decide handoffs and retired
+            # roots, so read them before the processing roots.
+            for ref in (CATALOG_REF, RETIREMENT_REF):
+                if ref[1] in self.files.get(ref[0], set()):
                     self.references.add(ref)
-                    self.pending.add(ref)
-        while self.pending:
-            ref = min(self.pending)
-            self.pending.remove(ref)
-            if ref in self.seen:
-                continue
-            self.seen.add(ref)
-            payload = self.load(ref)
-            if payload is not None and self.validate(payload, *ref):
-                self.walk(payload, *ref)
-        # Publication currently has several independent locks. Re-read every
-        # root and its key inventory to detect a changing snapshot.
-        for bucket, files in self.files.items():
+                    self.seen.add(ref)
+                    payload = self.load(ref)
+                    if payload is not None:
+                        self.process(ref, payload)
+            for bucket, roots in self.root_names.items():
+                for path in sorted(roots):
+                    ref = (bucket, path)
+                    if ref not in self.retired_roots and ref not in self.seen:
+                        self.references.add(ref)
+                        self.pending.add(ref)
             try:
-                latest = self.store.list_files(bucket, ("",))
-                if {p for p in latest if is_root(p)} != {p for p in files if is_root(p)}:
-                    self.blockers.add(f"root inventory changed: {bucket}")
-            except Exception as error:
-                self.blockers.add(f"root inventory recheck failed: {bucket} ({type(error).__name__})")
-        for ref, digest in self.root_hashes.items():
-            try:
-                if hashlib.sha256(self.store.read_bytes(*ref)).hexdigest() != digest:
-                    self.blockers.add(f"root changed: {ref[0]}:{ref[1]}")
-            except Exception as error:
-                self.blockers.add(f"root recheck failed: {ref[0]}:{ref[1]} ({type(error).__name__})")
+                if not self.converge(pool):
+                    self.blockers.add(f"root inventory did not stabilize after {self.max_rounds} rounds")
+            except TimeoutError:
+                self.blockers.add(f"GC scan deadline reached with {len(self.pending)} unread roots/manifests")
+                pool.shutdown(wait=False, cancel_futures=True)
+        self.finalize()
         if self.missing:
             self.blockers.add("referenced objects are missing")
         buckets = {}
         complete = not self.blockers
         for bucket, files in self.files.items():
+            retired = sorted(path for path in files if (bucket, path) in self.retired_roots
+                             and (bucket, path) not in self.references)
             unreferenced = sorted(path for path in files if (bucket, path) not in self.references
-                                  and path.startswith(MANAGED_PREFIXES))
+                                  and path.startswith(managed_prefixes(bucket)))
+            # Run journals are deliberate telemetry: the same bytes are uploaded as
+            # an Actions artifact, and the active run keeps writing them. They are
+            # neither a content candidate nor an unknown format.
+            retained = sorted(path for path in files if path.startswith(RETAINED_PREFIXES))
+            # A root the retirement journal explicitly released is not managed by
+            # content prefix, but it is still a deliberate, bounded retirement.
+            # Without this tier those paths stayed "unmanaged" forever and the GC
+            # criterion could not reclaim its own superseded roots.
+            reclaimed = sorted(set(unreferenced) | set(retired))
             unmanaged = sorted(path for path in files if (bucket, path) not in self.references
-                               and not path.startswith(MANAGED_PREFIXES))
+                                and not path.startswith(managed_prefixes(bucket))
+                                and (bucket, path) not in self.retired_roots
+                                and not path.startswith(RETAINED_PREFIXES))
             buckets[bucket] = {
                 "objects": len(files),
                 "referenced": sum((bucket, path) in self.references for path in files),
@@ -357,11 +758,15 @@ class ReferenceGraph:
                     "".join(Path(path).suffixes[-2:]).lower() if path.endswith(".gz")
                     else Path(path).suffix.lower() or "(none)" for path in files).items())),
                 "unreferenced": unreferenced,
-                "candidates": unreferenced if complete else [],
+                "retired": retired,
+                "retained": retained,
+                "candidates": reclaimed if complete else [],
                 "unmanaged": unmanaged,
             }
         return {
             "version": 1, "mode": "report-only", "graph_complete": complete,
+            "consistency": "converged: every current root read at its latest listed version; "
+                           "references from earlier root versions unioned conservatively",
             "scanned_at": datetime.now(timezone.utc).isoformat(),
             "deletion_enabled": False,
             "deletion_blockers": ["remaining producers lack shared mutation coordination"],
@@ -386,8 +791,8 @@ def read_gc_state(store) -> dict:
 def plan_retention(state: dict, report: dict, grace_days: int, limit: int, today=None) -> tuple[dict, dict]:
     if not report.get("graph_complete"):
         raise RuntimeError("reference graph is incomplete; refusing orphan observations")
-    if grace_days < 1 or limit < 0:
-        raise ValueError("orphan grace must be positive and limit non-negative")
+    if grace_days < 0 or limit < 0:
+        raise ValueError("orphan grace and limit must be non-negative")
     today = today or date.today()
     current = {f"{bucket}:{path}" for bucket, data in report["buckets"].items()
                for path in data.get("candidates", [])}
@@ -409,21 +814,58 @@ def plan_retention(state: dict, report: dict, grace_days: int, limit: int, today
                      "past_grace_paths": eligible, "deletion_authorized": False}
 
 
+def report_exit_code(report: dict, allow_incomplete: bool = False) -> int:
+    """A report-only scan may race with writers and intentionally stay incomplete.
+
+    Retention and deletion never use this escape hatch: they require a complete
+    graph and pause every producer for the authoritative scan.
+    """
+    return 0 if report.get("graph_complete") or allow_incomplete else 1
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--skip-input-bucket", action="store_true")
     parser.add_argument("--record-observations", action="store_true")
     parser.add_argument("--storage", choices=("hub", "s3"), default="hub")
-    parser.add_argument("--grace-days", type=int, default=14)
+    parser.add_argument("--grace-days", type=int, default=0)
     parser.add_argument("--limit", type=int, default=0)
-    parser.add_argument("--generation-grace-days", type=int, default=30)
+    parser.add_argument("--generation-grace-days", type=int, default=0)
+    parser.add_argument("--workers", type=int, default=8,
+                        help="parallel root/manifest readers")
+    parser.add_argument("--max-rounds", type=int, default=20,
+                        help="root-only convergence rounds before reporting an unstable snapshot")
+    parser.add_argument("--deadline-minutes", type=int, default=0,
+                        help="write an incomplete report instead of exceeding this wall-clock budget")
+    parser.add_argument("--snapshot-retries", type=int, default=2,
+                        help="retry transient root/object races before returning an incomplete graph")
+    parser.add_argument("--allow-incomplete", action="store_true",
+                        help="exit zero when a report-only scan cannot converge; never authorizes retention")
     args = parser.parse_args()
-    if args.grace_days < 1 or args.limit < 0 or args.generation_grace_days < 30:
-        parser.error("orphan grace must be positive, generation grace at least 30 days and limit non-negative")
+    if (args.grace_days < 0 or args.limit < 0 or args.generation_grace_days < 0
+            or args.snapshot_retries < 0 or args.snapshot_retries > 5
+            or not 1 <= args.workers <= 128 or not 1 <= args.max_rounds <= 60):
+        parser.error("grace periods and limit must be non-negative")
     store = HubBucketStore() if args.storage == "hub" else S3BucketStore()
-    report = ReferenceGraph(store, not args.skip_input_bucket,
-                            args.generation_grace_days).build()
+    transient_markers = ("root inventory did not stabilize", "unreadable JSON", "root recheck failed",
+                         "root inventory recheck failed")
+    report = None
+    deadline = time.monotonic() + args.deadline_minutes * 60 if args.deadline_minutes > 0 else None
+    for attempt in range(args.snapshot_retries + 1):
+        report = ReferenceGraph(store, not args.skip_input_bucket, args.generation_grace_days,
+                                workers=args.workers, max_rounds=args.max_rounds, deadline=deadline).build()
+        if any("deadline reached" in blocker for blocker in report.get("blockers", [])):
+            break
+        if report["graph_complete"] or not any(
+                any(marker in blocker for marker in transient_markers)
+                for blocker in report.get("blockers", [])) or attempt == args.snapshot_retries:
+            break
+        delay = min(30, 2 ** attempt)
+        print(f"GC snapshot changed during read; retrying in {delay}s "
+              f"({attempt + 2}/{args.snapshot_retries + 1})", flush=True)
+        time.sleep(delay)
+    assert report is not None
     if report["graph_complete"]:
         state, report["retention"] = plan_retention(read_gc_state(store), report, args.grace_days, args.limit)
         if args.record_observations:
@@ -435,7 +877,9 @@ def main() -> int:
         print(f"{bucket}: objects={counts['objects']} referenced={counts['referenced']} "
               f"unreferenced={len(counts['unreferenced'])} unmanaged={len(counts['unmanaged'])}")
     print(f"graph_complete={report['graph_complete']} deletion_enabled=False report={args.output}")
-    return 0 if report["graph_complete"] else 1
+    if not report["graph_complete"]:
+        print("::warning::Reader GC report did not converge; deletion_enabled=False")
+    return report_exit_code(report, args.allow_incomplete)
 
 
 if __name__ == "__main__":

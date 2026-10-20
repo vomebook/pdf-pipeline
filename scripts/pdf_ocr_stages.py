@@ -47,6 +47,7 @@ PROGRESS_REGISTRY = "pdf_ocr_progress.json"
 RENDER_PROGRESS_REGISTRY = "pdf_render_progress.json"
 RENDER_RANGE_PAGES = 250
 RENDER_RANGE_THRESHOLD = 500
+MIN_OCR_IMAGE_SIDE_PIXELS = 8
 BUCKET = f"hf://buckets/{shared.PDF_PAGES_BUCKET}"
 OCR_INPUT_BUCKET = f"hf://buckets/{shared.PDF_OCR_INPUT_BUCKET}"
 SMALL_RENDER_MAX_SOURCE_BYTES = 100 * 1024 * 1024
@@ -597,7 +598,7 @@ def expand_render_tasks(queue, records):
     return tasks
 
 
-def render_book(item: dict, source: Path, bundle: Path) -> dict:
+def render_book(item: dict, source: Path, bundle: Path, *, force_ocr_native=False) -> dict:
     started = time.perf_counter()
     source_sha, source_bytes = shared.hash_file(source)
     if item.get("source_sha256") and item["source_sha256"] != source_sha:
@@ -606,22 +607,27 @@ def render_book(item: dict, source: Path, bundle: Path) -> dict:
     probe = item.get("probe") or (lin_pdf_text.probe(source) if lin_native else pdf_ocr.probe_pdf(source))
     presentation = item.get("reader_presentation") or pdf_ocr.reader_presentation(source)
     preserve_pdf = pdf_ocr.preserves_reader_pdf({"reader_presentation": presentation})
+    profile = render_profile() + ("-force-ocr-native-v1" if force_ocr_native else "")
     if "start" in item and not 1 <= item["start"] <= item["end"] <= probe["page_count"]:
         raise ValueError("invalid render page range")
     base = {**public_item(item), "source_sha256": source_sha, "source_bytes": source_bytes,
             "reader_presentation": presentation,
-            "render_profile": render_profile(), "profile": pdf_ocr.asset_profile(),
-            "page_count": probe["page_count"], "classification": probe["classification"]}
-    root = root_for(source_sha, item["key"], render_profile())
+            "render_profile": profile, "profile": pdf_ocr.asset_profile(),
+            "page_count": probe["page_count"],
+            "classification": "scan" if force_ocr_native else probe["classification"],
+            **({"force_ocr_native": True, "original_classification": probe["classification"]}
+               if force_ocr_native else {})}
+    root = root_for(source_sha, item["key"], profile)
     bundle.mkdir(parents=True, exist_ok=True)
     pages = []
     force_image_render = bool(item.get("force_image_render")) and not preserve_pdf
     first, last = item.get("start", 1), item.get("end", probe["page_count"])
     scan_images = (pdf_ocr.scan_reader_images(source, first, last)
-                   if not preserve_pdf and any(chars == 0 for chars in probe["page_chars"][first - 1:last])
+                   if not force_ocr_native and not preserve_pdf
+                   and any(chars == 0 for chars in probe["page_chars"][first - 1:last])
                    else {})
     native_text = {}
-    if not lin_native:
+    if not lin_native and not force_ocr_native:
         native_numbers = [number for number in range(first, last + 1)
                           if probe["classification"] == "native-text"
                           or probe["page_chars"][number - 1] >= pdf_ocr.MIN_NATIVE_PAGE_CHARS]
@@ -630,7 +636,7 @@ def render_book(item: dict, source: Path, bundle: Path) -> dict:
     with tempfile.TemporaryDirectory(dir=bundle) as temp, (
             lin_pdf_text.pymupdf.open(source) if lin_native else nullcontext(None)) as document:
         for number in range(item.get("start", 1), item.get("end", probe["page_count"]) + 1):
-            if probe["classification"] == "native-text" and not force_image_render:
+            if not force_ocr_native and probe["classification"] == "native-text" and not force_image_render:
                 text = lin_pdf_text.extract(document, number) if lin_native else native_text[number]
                 payload = pdf_ocr.page_payload(number, text["width"], text["height"], text["blocks"], "native")
                 payload.update(ocr_layout.arrange(payload["blocks"], payload["width"], payload["height"], {}))
@@ -644,7 +650,8 @@ def render_book(item: dict, source: Path, bundle: Path) -> dict:
                 set_page_meta(page, "o", metadata(out, bundle))
                 pages.append(page)
                 continue
-            native = probe["classification"] == "native-text" or probe["page_chars"][number - 1] >= pdf_ocr.MIN_NATIVE_PAGE_CHARS
+            native = not force_ocr_native and (probe["classification"] == "native-text"
+                     or probe["page_chars"][number - 1] >= pdf_ocr.MIN_NATIVE_PAGE_CHARS)
             reader_pixels = scan_images.get(number) if not native and probe["page_chars"][number - 1] == 0 else None
             png, width, height = pdf_ocr.render_page(source, number, Path(temp), reader_pixels,
                                                      reader_jxl=pdf_ocr.JXL_ENABLED and not preserve_pdf,
@@ -695,7 +702,7 @@ def render_book(item: dict, source: Path, bundle: Path) -> dict:
     if image_pages:
         page_manifest = bundle / root / "page-manifest.json"
         pdf_ocr.write_json(page_manifest, pdf_assets.compact_page_manifest(
-            source_sha, render_profile(), image_pages, manifest_dir=root))
+            source_sha, profile, image_pages, manifest_dir=root))
         page_manifest_meta = {**metadata(page_manifest, bundle), "version": pdf_assets.PAGE_MANIFEST_VERSION}
     manifest = {**base, "version": 1, "kind": "pdf-render", "complete": True,
                 "image_rendered": bool(image_pages), "pages": pages, "page_manifest": page_manifest_meta}
@@ -956,11 +963,23 @@ def recognize_task(task, bundle):
                         width, height = rotated.size
                         rotated.save(png)
                         rotated.close()
-                if pdf_ocr.resolve_ocr_config(task["ocr_language"], task["ocr_backend"]) == pdf_ocr.resolve_ocr_config():
-                    blocks = pdf_ocr.ocr_page(png, width, height)
+                degenerate = min(width, height) < MIN_OCR_IMAGE_SIDE_PIXELS
+                if degenerate:
+                    # A thin scan strip such as 2200x3 pixels cannot contain
+                    # recoverable text at the rendered resolution. Preserve it
+                    # as an empty OCR page rather than letting RapidOCR reject
+                    # the whole book with ResizeImgError.
+                    blocks = []
+                    print(f"OCR page {page['p']}: skipped degenerate image {width}x{height} "
+                          f"({task['key']})", flush=True)
                 else:
-                    blocks = pdf_ocr.ocr_page(png, width, height, task["ocr_language"], task["ocr_backend"])
+                    if pdf_ocr.resolve_ocr_config(task["ocr_language"], task["ocr_backend"]) == pdf_ocr.resolve_ocr_config():
+                        blocks = pdf_ocr.ocr_page(png, width, height)
+                    else:
+                        blocks = pdf_ocr.ocr_page(png, width, height, task["ocr_language"], task["ocr_backend"])
                 payload = pdf_ocr.page_payload(page["p"], page["width"], page["height"], blocks, "ocr")
+                if degenerate:
+                    payload["ocr_warning"] = "degenerate-image-below-minimum-side"
                 arranged = ocr_layout.arrange(blocks, width, height, options)
                 payload.update(ocr_layout.restore_coordinates(arranged, rotation))
                 out = bundle / root / "ocr" / f"page-{page['p']:06d}.json.gz"

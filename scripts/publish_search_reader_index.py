@@ -8,6 +8,7 @@ import os
 import shutil
 import subprocess
 import tempfile
+import time
 from pathlib import Path
 
 from huggingface_hub import HfApi
@@ -15,22 +16,35 @@ from huggingface_hub import HfApi
 try:
     from .reader_assets import READER_ASSETS_REPO
     from .reader_bucket import INDEX_FILES, read_bytes as read_bucket_bytes
-    from .publish_reader_v3 import current as current_v3, project_sidecar
+    from .publish_reader_v3 import current as current_v3, project_sidecar, pinned_base, unify, CentralHubStore, PROTOCOL
     from .reader_bucket_store import HubBucketStore
 except ImportError:
     from reader_assets import READER_ASSETS_REPO
     from reader_bucket import INDEX_FILES, read_bytes as read_bucket_bytes
-    from publish_reader_v3 import current as current_v3, project_sidecar
+    from publish_reader_v3 import current as current_v3, project_sidecar, pinned_base, unify, CentralHubStore, PROTOCOL
     from reader_bucket_store import HubBucketStore
 
 SIDECAR_NAME = "reader_assets.json.gz"
+
+
+def synchronize_pinned_base(*, dry_run: bool) -> bool:
+    """Refresh all-format routing under the verified writer, independent of OCR work."""
+    if dry_run or os.environ.get("READER_V3_WRITE_PROTOCOL") != PROTOCOL:
+        return False
+    store = CentralHubStore()
+    store.assert_serialized_writer(PROTOCOL)
+    unify(store, apply=True)
+    return True
 
 
 def run(args: list[str], cwd: str | None = None, env: dict | None = None):
     merged = os.environ.copy()
     if env:
         merged.update(env)
-    result = subprocess.run(args, cwd=cwd, env=merged, capture_output=True, text=True)
+    try:
+        result = subprocess.run(args, cwd=cwd, env=merged, capture_output=True, text=True, timeout=180)
+    except subprocess.TimeoutExpired:
+        return 124, "", "Git operation timed out"
     return result.returncode, result.stdout.strip(), result.stderr.strip()
 
 
@@ -49,6 +63,27 @@ def publish_to_pages(source: Path, pages_repo: str, token: str, *, dry_run: bool
         return
     if not pages_repo or not token:
         raise RuntimeError("PAGES_REPO and PAGES_TOKEN are required")
+    for attempt in range(4):
+        try:
+            _publish_to_pages_once(source, pages_repo, token)
+            return
+        except RuntimeError as error:
+            detail = str(error).lower()
+            transient = any(code in detail for code in (
+                "fatal error in commit_refs", "non-fast-forward", "fetch first",
+                "timed out", "connection reset", "could not resolve host", "http 502", "http 503", "http 504",
+                "requested url returned error: 502", "requested url returned error: 503",
+                "requested url returned error: 504",
+            ))
+            if not transient or attempt == 3:
+                raise
+            print(f"transient Pages publication failure; rebuilding from current main ({attempt + 2}/4)", flush=True)
+            time.sleep(2 ** (attempt + 1))
+
+
+def _publish_to_pages_once(source: Path, pages_repo: str, token: str) -> None:
+    # Each retry uses a fresh private clone and changes only this generated file.
+    # An accepted push whose response was lost becomes a no-op; never force push.
     with tempfile.TemporaryDirectory(prefix="reader-index-pages-") as root:
         auth = git_auth_env(token)
         ret, out, err = run(["git", "clone", "--depth", "1", f"https://github.com/{pages_repo}.git", root], env=auth)
@@ -91,9 +126,11 @@ def main() -> int:
     temporary_source = False
     if type(api) is HfApi:
         raw = read_bucket_bytes(INDEX_FILES["sidecar"], hf_token)
-        pointer, catalog = current_v3(HubBucketStore())
+        store = HubBucketStore()
+        synchronize_pinned_base(dry_run=args.dry_run)
+        pointer, catalog = current_v3(store)
         if pointer:
-            base = json.loads(gzip.decompress(raw))
+            base = pinned_base(store, catalog, json.loads(gzip.decompress(raw)))
             raw = gzip.compress(json.dumps(project_sidecar(base, catalog), ensure_ascii=False,
                                            sort_keys=True, separators=(",", ":")).encode(), mtime=0)
         with tempfile.NamedTemporaryFile(prefix="reader-index-", suffix=".gz", delete=False) as handle:

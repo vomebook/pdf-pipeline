@@ -71,7 +71,6 @@ class FetchAndParseTests(unittest.TestCase):
         self.assertEqual(result, "catalog\n")
         sleep.assert_called_once_with(self.module.HTTP_RETRY_AFTER_CAP_SECONDS)
 
-
     def test_http_429_retry_parses_hf_countdown_from_error_body(self):
         error = urllib.error.HTTPError(
             "https://example.test", 429, "rate limited", {},
@@ -88,7 +87,6 @@ class FetchAndParseTests(unittest.TestCase):
         self.assertEqual(result, "catalog\n")
         sleep.assert_called_once_with(23)
 
-
     def test_http_retry_after_date_is_parsed(self):
         from datetime import datetime, timezone
         from email.utils import format_datetime
@@ -99,7 +97,6 @@ class FetchAndParseTests(unittest.TestCase):
             {"Retry-After": format_datetime(retry_at, usegmt=True)}, None)
 
         self.assertIn(self.module._retry_delay(0, error), {44, 45})
-
 
     def test_text_request_retries_transient_network_errors(self):
         response = Mock()

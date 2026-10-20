@@ -18,20 +18,30 @@ import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
-from huggingface_hub import batch_bucket_files, download_bucket_files, list_bucket_tree
-
-from ccrd_source_override import CORPUS_PATH, download_override
+from huggingface_hub import batch_bucket_files, download_bucket_files
 
 try:
     from . import shared
+    from .ccrd_source_override import (
+        CORPUS_MIGRATION_VERSION,
+        CORPUS_PATH,
+        download_override,
+        migrate_corpus,
+    )
 except ImportError:
     import shared
+    from ccrd_source_override import (
+        CORPUS_MIGRATION_VERSION,
+        CORPUS_PATH,
+        download_override,
+        migrate_corpus,
+    )
 
 
 SOURCE_ARCHIVE_URL = "https://github.com/anftm/pipeline/releases/download/ccrd/ccrd-corpus.tar.gz"
 SOURCE_ARCHIVE_SHA256 = "a6b1615054303740e892e535e3c9a6d4f4805ac572f7f1577b10685249a862f1"
 BUILDER_URL = "https://huggingface.co/spaces/vomebook/Search/resolve/main/build_fulltext_db.py"
-BUILDER_SHA256 = "293f0c65db6a4709cb756f9bbbcaa95d3f7dbb2442e21e91f9f181f166dc1e53"
+BUILDER_SHA256 = "ed3cfbb2af5871c8a5d368512e939aa4164aebd71f43e1ff9af6cde3e0a02fac"
 BUCKET = "vomebook/ccrd-index"
 SOURCES = ("CCRD", "CW")
 TOKENIZER_VERSION = "cjk-bigram-boundary-fts5-v6-snippet-anchors"
@@ -93,12 +103,14 @@ def inspect_database(path: Path, expected_documents: int) -> dict[str, int | str
 
 
 def read_current(workdir: Path, token: str) -> dict | None:
-    target = workdir / CURRENT_PATH
+    # Do not overwrite the freshly generated current.json while reading its parent.
+    target = workdir / "previous-current.json"
     try:
         download_bucket_files(BUCKET, files=[(CURRENT_PATH, str(target))], token=token)
     except Exception as exc:
-        print(f"No prior current manifest: {type(exc).__name__}", flush=True)
-        return None
+        if getattr(getattr(exc, "response", None), "status_code", None) == 404:
+            return None
+        raise RuntimeError("cannot verify prior CCRD manifest; refusing stale publication") from exc
     try:
         return json.loads(target.read_text(encoding="utf-8"))
     except FileNotFoundError:
@@ -136,12 +148,9 @@ def main() -> int:
         search_data = checkout / "data/search_data.json.gz"
         if not search_data.exists():
             raise RuntimeError("source checkout lacks data/search_data.json.gz")
-        counts = expected_counts(search_data)
-        corpus_target = checkout / CORPUS_PATH
-        if not corpus_target.is_file():
-            raise RuntimeError(f"corpus lacks legacy CCRD target path: {CORPUS_PATH}")
-        print("Replacing the changing CCRD source text", flush=True)
-        override = download_override(corpus_target)
+        print("Applying the CW layout migration and replacing the changing source", flush=True)
+        override = download_override(checkout / CORPUS_PATH)
+        counts = migrate_corpus(checkout)
 
         print("Building CCRD full-text indexes", flush=True)
         subprocess.run([sys.executable, "build_fulltext_db.py"], cwd=checkout, check=True)
@@ -155,7 +164,10 @@ def main() -> int:
             databases[source] = inspect_database(path, counts[source])
             files[source] = path
 
-        generation = f"ccrd-{archive_digest[:16]}-{builder_digest[:16]}-{override['sha256'][:16]}"
+        generation = (
+            f"ccrd-{archive_digest[:16]}-{builder_digest[:16]}-"
+            f"{override['sha256'][:16]}-{CORPUS_MIGRATION_VERSION}"
+        )
         prefix = f"generations/{generation}"
         manifest = {
             "format": 1,
@@ -166,6 +178,7 @@ def main() -> int:
             },
             "builder": {"url": BUILDER_URL, "sha256": builder_digest},
             "source_overrides": {str(CORPUS_PATH): override},
+            "corpus_migration": CORPUS_MIGRATION_VERSION,
             "tokenizer_version": TOKENIZER_VERSION,
             "created_at": datetime.now(timezone.utc).isoformat(),
             "databases": {
@@ -191,28 +204,14 @@ def main() -> int:
             ],
             token=token,
         )
-        # Publish the pointer only after both immutable database files are present.
-        # Buckets are mutable but an existing small pointer can remain cached. Recreate it
-        # after the immutable generation is complete rather than relying on an overwrite.
-        batch_bucket_files(BUCKET, delete=[CURRENT_PATH], token=token)
+        # Retain the old pointer until replacement is ready. Cache invalidation
+        # must not create a no-pointer window or authorize deleting old generations.
+        if read_current(workdir, token) != previous_manifest:
+            raise RuntimeError("CCRD pointer changed during index publication")
         batch_bucket_files(BUCKET, add=[(str(manifest_path), CURRENT_PATH)], token=token)
-
-        retained_prefixes = {prefix + "/"}
-        if isinstance(previous_manifest, dict):
-            for details in previous_manifest.get("databases", {}).values():
-                if not isinstance(details, dict):
-                    continue
-                previous_path = details.get("path")
-                if isinstance(previous_path, str) and previous_path.startswith("generations/"):
-                    retained_prefixes.add(previous_path.rsplit("/", 1)[0] + "/")
-        stale_paths = sorted(
-            item.path
-            for item in list_bucket_tree(BUCKET, prefix="generations", recursive=True, token=token)
-            if item.type == "file" and not any(item.path.startswith(retained) for retained in retained_prefixes)
-        )
-        if stale_paths:
-            batch_bucket_files(BUCKET, delete=stale_paths, token=token)
-            print("Deleted previous or incomplete generation files", flush=True)
+        if read_current(workdir, token) != manifest:
+            raise RuntimeError("CCRD pointer readback differs from the completed manifest")
+        print("Retained all existing generations; collection is a separate explicit operation", flush=True)
         print(json.dumps(manifest, ensure_ascii=False, indent=2), flush=True)
         return 0
     finally:
