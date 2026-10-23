@@ -436,9 +436,22 @@ def save_registry(api, repo, name, updates, merge=None, publish_streams=False):
 
 
 def same_source(entry, item):
-    return bool(entry and entry.get("source_revision") == item.get("source_revision")
-                and entry.get("source_kind") == item.get("source_kind")
-                and entry.get("reader_assets_path") == item.get("reader_assets_path"))
+    """Same source bytes, not merely the same repository revision.
+
+    A repository-wide revision bump can leave a DJVU/PDF byte-identical. Render
+    roots are keyed by source SHA-256, so treating that revision as a new source
+    would requeue the book and collide with the immutable range objects already
+    published under the same root. Fall back to the revision only for legacy
+    entries that do not carry a source SHA.
+    """
+    if not entry or entry.get("source_kind") != item.get("source_kind"):
+        return False
+    if entry.get("reader_assets_path") != item.get("reader_assets_path"):
+        return False
+    source_sha = item.get("source_sha256")
+    if isinstance(source_sha, str) and len(source_sha) == 64:
+        return entry.get("source_sha256") == source_sha
+    return entry.get("source_revision") == item.get("source_revision")
 
 
 def ocr_publication_is_current(previous, book):

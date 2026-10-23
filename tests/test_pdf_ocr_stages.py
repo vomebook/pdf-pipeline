@@ -832,6 +832,17 @@ class PdfOcrStagesTests(unittest.TestCase):
         self.assertNotEqual(stages.generation_for(first["books"][0]), stages.generation_for(changed["books"][0]))
         self.assertEqual(first["books"][0]["render_manifest"], changed["books"][0]["render_manifest"])
 
+    def test_same_source_ignores_revision_drift_for_identical_bytes(self):
+        base = {"source_sha256": "a" * 64, "source_kind": "upstream", "reader_assets_path": None}
+        previous = {**base, "source_revision": "old"}
+        current = {**base, "source_revision": "new"}
+        self.assertTrue(stages.same_source(previous, current))
+        self.assertFalse(stages.same_source({**previous, "source_sha256": "b" * 64}, current))
+        self.assertFalse(stages.same_source({**previous, "source_kind": "generated"}, current))
+        legacy = {"source_kind": "upstream", "reader_assets_path": None, "source_revision": "old"}
+        self.assertTrue(stages.same_source(legacy, legacy))
+        self.assertFalse(stages.same_source(legacy, {**legacy, "source_revision": "new"}))
+
     def test_identical_ready_ocr_publication_is_noop(self):
         book = {"source_sha256": "a" * 64, "source_revision": "b" * 40,
                 "source_kind": "upstream", "profile": "ocr-profile", "page_count": 12,
