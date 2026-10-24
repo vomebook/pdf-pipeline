@@ -117,7 +117,10 @@ def resolve_ocr_config(language=None, backend=None):
 
 
 def detect_language(value: str) -> str:
-    text = str(value or "")
+    # Only the file name is evidence. Repository and directory names are
+    # Latin-heavy and used to turn Chinese books into "en" guesses.
+    text = str(value or "").rsplit("\0", 1)[-1]
+    text = re.sub(r"\.[A-Za-z0-9]{1,5}$", "", text)
     counts = {
         "ch": sum("\u3400" <= c <= "\u9fff" for c in text),
         "japan": sum(("\u3040" <= c <= "\u30ff") for c in text),
@@ -137,18 +140,58 @@ def detect_language(value: str) -> str:
 
 
 def book_ocr_config(book: dict):
-    language = book.get("ocr_language") or detect_language(book.get("key", ""))
-    backend = book.get("ocr_backend") or ("rapidocr_onnxruntime" if language in {"ch", "en"} else "paddle_onnxruntime")
+    override = language_override(book.get("key", ""))
+    language = (override or {}).get("language") or book.get("ocr_language") or detect_language(book.get("key", ""))
+    backend = ((override or {}).get("backend") or book.get("ocr_backend")
+               or ("rapidocr_onnxruntime" if language in {"ch", "en"} else "paddle_onnxruntime"))
     language, _, backend = resolve_ocr_config(language, backend)
     return language, backend
 
 
-def asset_profile(language=None, backend=None) -> str:
+LANGUAGE_OVERRIDES_PATH = Path(os.environ.get(
+    "PDF_OCR_LANGUAGE_OVERRIDES", "state/ocr_language_overrides.json"))
+_LANGUAGE_OVERRIDES = None
+
+
+def language_overrides() -> dict:
+    """Exact-key language overrides; explicit evidence outranks filenames."""
+    global _LANGUAGE_OVERRIDES
+    if _LANGUAGE_OVERRIDES is None:
+        try:
+            payload = json.loads(LANGUAGE_OVERRIDES_PATH.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            _LANGUAGE_OVERRIDES = {}
+        else:
+            if payload.get("version") != 1 or not isinstance(payload.get("overrides"), dict):
+                raise ValueError("invalid OCR language override file")
+            for key, value in payload["overrides"].items():
+                if not isinstance(key, str) or not key or not isinstance(value, dict):
+                    raise ValueError("invalid OCR language override entry")
+                resolve_ocr_config(value.get("language"), value.get("backend"))
+            _LANGUAGE_OVERRIDES = payload["overrides"]
+    return _LANGUAGE_OVERRIDES
+
+
+def language_override(key: str):
+    return language_overrides().get(key)
+
+
+def language_source(book: dict) -> str:
+    if language_override(book.get("key", "")):
+        return "override"
+    if book.get("ocr_language"):
+        return "registry"
+    return "filename"
+
+
+def asset_profile(language=None, backend=None, revision=None) -> str:
     language, version, backend = resolve_ocr_config(language, backend)
     model_profile = OCR_PROFILE if language == "ch" and version == "PP-OCRv6" and backend == "paddle_static" else (
         f"pdf-ocr-v1-{version.lower()}-medium-lang-{language}")
     if backend != "paddle_static":
         model_profile += f"-backend-{backend.replace('_', '-')}"
+    if revision:
+        model_profile += f"-rev-{revision}"
     return (f"{model_profile}-dpi-{OCR_DPI}-webp-{WEBP_QUALITY}-{WEBP_MAX_DIMENSION}"
             f"-native-{MIN_NATIVE_PAGE_CHARS}-{NATIVE_PAGE_RATIO:g}-maxpix-{MAX_PAGE_PIXELS}"
             f"-jxl-{int(JXL_ENABLED)}-{JXL_DISTANCE:g}-{JXL_EFFORT}")
@@ -163,6 +206,7 @@ def valid_published_profile(profile: str) -> bool:
         r"pdf-ocr-v1-pp-ocrv[56]-medium"
         r"(?:-lang-[a-z0-9_]+)?"
         r"(?:-backend-(?:paddle-onnxruntime|rapidocr-onnxruntime))?"
+        r"(?:-rev-[a-z0-9._-]+)?"
         r"-dpi-[0-9]+-webp-[0-9]+-[0-9]+"
         r"-native-[0-9]+(?:\.[0-9]+)?-[0-9]+(?:\.[0-9]+)?"
         r"-maxpix-[0-9]+-jxl-[01]-[0-9]+(?:\.[0-9]+)?-[0-9]+",
@@ -174,8 +218,8 @@ def ocr_profile_without_jxl(profile: str) -> str:
     return str(profile or "").split("-jxl-", 1)[0]
 
 
-def object_root(source_sha: str, key: str, language=None, backend=None) -> Path:
-    key_sha = hashlib.sha256(f"{key}\0{asset_profile(language, backend)}".encode("utf-8")).hexdigest()[:16]
+def object_root(source_sha: str, key: str, language=None, backend=None, revision=None) -> Path:
+    key_sha = hashlib.sha256(f"{key}\0{asset_profile(language, backend, revision)}".encode("utf-8")).hexdigest()[:16]
     return Path("objects") / source_sha[:2] / source_sha / key_sha
 
 
