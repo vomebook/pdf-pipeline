@@ -56,10 +56,8 @@ CONVERTIBLE_EXTENSIONS = {
     "odt": ("calibre-odt-html-v1", "html", "document.html"),
     "rtf": ("calibre-rtf-html-v1", "html", "document.html"),
     "chm": ("calibre-chm-epub-v4-source-text", "epub", "document.epub"),
-    "tif": ("pillow-pdf-v2", "pdf", "document.pdf"),
-    "tiff": ("pillow-pdf-v2", "pdf", "document.pdf"),
     "ppt": ("libreoffice-pdf-office-v2", "pdf", "document.pdf"),
-    "pptx": ("libreoffice-pdf-office-v2", "pdf", "document.pdf"),
+    "pptx": ("libreoffice-pdf-symbols-v3", "pdf", "document.pdf"),
     "pps": ("libreoffice-pdf-office-v2", "pdf", "document.pdf"),
     "odp": ("libreoffice-pdf-office-v2", "pdf", "document.pdf"),
     "xls": ("libreoffice-pdf-office-v2", "pdf", "document.pdf"),
@@ -245,6 +243,8 @@ def validate_chapter_manifest(manifest: dict) -> dict:
                 or search_index.get("bytes", 0) <= 0
                 or not re.fullmatch(r"[0-9a-f]{64}", str(search_index.get("sha256", "")))):
             raise ValueError("invalid EPUB search index metadata")
+        if "text_profile" in search_index and search_index["text_profile"] != "dom-text-v1":
+            raise ValueError("unsupported EPUB search text profile")
     if manifest.get("fallback") is not None:
         validate_object_path(manifest["fallback"])
     return manifest

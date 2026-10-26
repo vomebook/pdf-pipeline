@@ -78,7 +78,7 @@ class PdfWorkerLaneTests(unittest.TestCase):
         self.assertEqual((entry["pd"], entry["pdb"]), (path, shared.PDF_PAGES_BUCKET))
         files = {}
         add_pdf_streams(files, {"files": {"key": result}}, shared.PDF_PAGES_BUCKET)
-        self.assertEqual(files["key"], entry)
+        self.assertNotIn('key', files, 'converted PDFs no longer publish page-stream routes')
         original = {"s": 2, "m": "p", "p": path, "b": shared.PDF_PAGES_BUCKET}
         rebuilt = shared.pdf_pages_sidecar_entry(stream, {}, original)
         self.assertEqual((rebuilt["pd"], rebuilt["pdb"]), (path, shared.PDF_PAGES_BUCKET))
@@ -157,6 +157,14 @@ class PdfWorkerLaneTests(unittest.TestCase):
         for variant in variants:
             with self.assertRaises(ValueError):
                 lanes.validate_queue(self.config, variant, "vomebook", "render")
+        # Legacy fallback records predate lane propagation but are unambiguous.
+        fallback = {**self.item(), "djvu_pdf_fallback": "pdf-magic"}
+        fallback.pop("worker_lane", None)
+        lanes.validate_queue(self.config, dict(queue, books=[fallback]), "vomebook", "render")
+        foreign = {**fallback, "key": "repo\0big.pdf", "source_extension": "pdf",
+                   "path": "big.pdf", "source_bytes": 2**40}
+        with self.assertRaises(ValueError):
+            lanes.validate_queue(self.config, dict(queue, books=[foreign]), "vomebook", "render")
 
     def test_compact_time_weighted_tasks_retain_book_ownership(self):
         item = self.item(page_count=2, source_sha256="a" * 64, profile="profile")

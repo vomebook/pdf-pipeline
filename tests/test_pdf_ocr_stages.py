@@ -5,21 +5,83 @@ import json
 import sys
 import tempfile
 import unittest
+import yaml
 from pathlib import Path
 from unittest.mock import Mock, patch
 
 from PIL import Image
 
-from scripts import pdf_ocr, pdf_ocr_stages as stages, plan_pdf_ocr
+from scripts import pdf_ocr, pdf_ocr_stages as stages, plan_pdf_ocr, ocr_quality, ocr_layout
 from scripts.build_reader_assets_index import build_index
 
 
 class PdfOcrStagesTests(unittest.TestCase):
+    def test_secondary_formula_identity_is_recorded_without_overwriting_primary_model(self):
+        from types import SimpleNamespace
+        import numpy as np
+        result=self.render_fixture(native=False)
+        with patch.object(stages,'read_object',side_effect=self.read):
+            queue=stages.plan_images({result['key']:result},{},{},target=500)
+            task=queue['shards'][0][0]
+            primary=SimpleNamespace(recognize_txt=lambda images:SimpleNamespace(txts=['OH-1'],scores=[.84]))
+            secondary=SimpleNamespace(recognize_txt=lambda images:SimpleNamespace(txts=['-1'],scores=[.99]))
+            calls=[]
+            def engine(*args,**kwargs):
+                calls.append(kwargs.get('model_size','medium'))
+                return secondary if kwargs.get('model_size')=='small' else primary
+            def models(*args,**kwargs):
+                return {'models':{'det':{'sha256':'a'*64},'rec':{
+                    'sha256':stages.ocr_formula_scripts.CONFIRMATION_REC_SHA256 if kwargs.get('model_size')=='small' else 'b'*64}}}
+            def refine(image,blocks,read,*,read_secondary=None):
+                self.assertEqual(read(np.zeros((20,20,3),np.uint8)),('OH-1',.84))
+                self.assertEqual(read_secondary(np.zeros((20,20,3),np.uint8)),('-1',.99))
+                return blocks,None
+            with patch.object(pdf_ocr,'RAPID_MODEL_SIZE','medium'), \
+                    patch.object(pdf_ocr,'ocr_page',return_value=[{'t':'正文','b':[.1,.1,.5,.2],'c':.8,'s':'ocr'}]), \
+                    patch.object(pdf_ocr,'get_ocr_engine',side_effect=engine), \
+                    patch.object(pdf_ocr,'actual_ocr_models',side_effect=models), \
+                    patch.object(stages.ocr_formula_scripts,'refine_tokens',side_effect=refine):
+                actual=stages.recognize_task(task,self.root/'secondary-formula')
+            self.assertEqual(actual['errors'],[])
+            self.assertIn('small',calls)
+            for page in actual['pages']:
+                model=page['recognition']['models']['models']
+                self.assertEqual(model['rec']['sha256'],'b'*64)
+                self.assertEqual(model['formula_confirmation_rec']['sha256'],stages.ocr_formula_scripts.CONFIRMATION_REC_SHA256)
+
+    def test_language_override_changes_recognition_profile(self):
+        key = "repo\0中文目录/俄文书.pdf"
+        options = stages.layout_options({}, key)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "overrides.json"
+            path.write_text(json.dumps({"version": 1, "overrides": {
+                key: {"language": "ru", "backend": "paddle_onnxruntime", "source": "osd-triage"}}}))
+            with patch.object(pdf_ocr, "LANGUAGE_OVERRIDES_PATH", path):
+                pdf_ocr._LANGUAGE_OVERRIDES = None
+                try:
+                    overridden = stages.recognition_identity(
+                        {"key": key, "ocr_language": "ch", "ocr_backend": "rapidocr_onnxruntime"}, options)
+                    self.assertIn("-lang-ru", overridden)
+                    self.assertIn("paddle-onnxruntime", overridden)
+                finally:
+                    pdf_ocr._LANGUAGE_OVERRIDES = None
+        plain = stages.recognition_identity(
+            {"key": key, "ocr_language": "ch", "ocr_backend": "rapidocr_onnxruntime"}, options)
+        self.assertNotEqual(overridden, plain)
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
         self.objects = {}
+        model_patch = patch.object(pdf_ocr, "actual_ocr_models", return_value={"models": {
+            "det": {"sha256": "a" * 64}, "rec": {"sha256": "b" * 64}}})
+        model_patch.start()
+        self.addCleanup(model_patch.stop)
+        probe_patch = patch.object(ocr_quality, "probe_image", return_value={"blank": False,
+            "regions": [{"region": "whole", "script": "Han", "confidence": 8, "rotation": 0}]})
+        probe_patch.start()
+        self.addCleanup(probe_patch.stop)
 
     def store(self, bundle):
         for path in bundle.rglob("*"):
@@ -38,44 +100,59 @@ class PdfOcrStagesTests(unittest.TestCase):
                 "source_kind": "upstream", "source_revision": "revision",
                 "reader_presentation": {"strategy": "page-stream", "complete": True}}
 
-    def render_fixture(self, native=False, jxl=False, force_image=False, native_only=False):
-        source = self.root / "source.pdf"
-        source.write_bytes(b"%PDF-test-source")
+    def render_fixture(self, native=False, jxl=False, force_image=False, native_only=False, djvu=True):
+        source = self.root / ("source.djvu" if djvu else "source.pdf")
+        source.write_bytes(b"AT&TFORM-test-source" if djvu else b"%PDF-test-source")
         bundle = self.root / "render"
-        def render(_source, page, directory, reader_pixels=None, reader_jxl=False):
+        def render(_source, page, directory, reader_pixels=None, reader_jxl=False, reader_images=True, **_kwargs):
             path = directory / f"page-{page:06d}.png"
             with Image.new("RGB", (200, 300), "white") as image:
                 image.save(path)
-                image.resize((100, 150)).save(path.with_suffix(".webp"))
+                if reader_images:
+                    image.resize((100, 150)).save(path.with_suffix(".webp"))
             return path, 200, 300
         def encode(png, destination):
             with Image.open(png) as image:
                 self.assertEqual(image.size, (200, 300))
             destination.write_bytes(b"jxl")
-        item = {**self.item(), "probe": {"page_count": 2, "page_chars": [60, 60] if native_only else
+        item = {**self.item(), **({'source_format': 'djvu', 'key': 'repo\0small.djvu',
+                                 'path': 'small.djvu'} if djvu else {}),
+                'reader_presentation': {'strategy': 'page-stream' if djvu else 'preserve-pdf'},
+                "probe": {"page_count": 2, "page_chars": [60, 60] if native_only else
                                          [60 if native else 0, 0],
                                          "classification": "native-text" if native_only else "mixed" if native else "scan"},
                 **({"force_image_render": True} if force_image else {})}
-        with patch.object(pdf_ocr, "render_page", side_effect=render), \
+        native_pages = {page: {"width": 200, "height": 300,
+                            "blocks": [{"t": "原生文字", "b": [.1, .1, .9, .2], "c": 1, "s": "native"}],
+                            "text": "原生文字"} for page in (1, 2)}
+        with patch.object(stages.djvu_pages, 'sniff', return_value='djvu'), \
+                patch.object(stages.djvu_pages, 'inspect', return_value=[{'width': 200, 'height': 300}] * 2), \
+                patch.object(stages.djvu_pages, 'text_pages', return_value=native_pages), \
+                patch.object(stages.djvu_pages, 'render_page', side_effect=render), \
+                patch.object(pdf_ocr, "render_page", side_effect=render), \
                 patch.object(pdf_ocr, "JXL_ENABLED", jxl), \
                 patch.object(pdf_ocr, "encode_jxl", side_effect=encode), \
                 patch.object(pdf_ocr, "native_pages", side_effect=lambda _source, pages: {
-                    page: {"width": 200, "height": 300, "blocks": [], "text": "原生文字"}
+                    page: {"width": 200, "height": 300,
+                           "blocks": [{"t": "原生文字", "b": [.1, .1, .9, .2], "c": 1, "s": "native"}],
+                           "text": "原生文字"}
                     for page in pages}), \
                 patch.object(pdf_ocr, "ocr_page", side_effect=AssertionError("renderer must not OCR")):
             result = stages.render_book(item, source, bundle)
         self.store(bundle)
         return result
 
-    def test_whole_book_page_stream_carries_valid_pdf_outline(self):
+    def test_primary_pdf_keeps_outline_in_document_without_generating_page_stream(self):
         toc = [{"title": "封面", "page": 1, "depth": 0}, {"title": "正文", "page": 2, "depth": 0}]
-        with patch.object(stages.pdf_assets, "extract_pdf_outline", return_value=toc):
-            result = self.render_fixture()
-        self.assertEqual(json.loads(self.read(result["page_manifest"]))["toc"], toc)
+        with patch.object(stages.pdf_assets, "extract_pdf_outline", return_value=toc) as outline:
+            result = self.render_fixture(djvu=False)
+        self.assertIsNone(result['page_manifest'])
+        self.assertFalse(result['image_rendered'])
+        outline.assert_not_called()
         self.assertEqual(stages.valid_toc([{"title": "x", "page": 3, "depth": 0}], 2), [])
         self.assertEqual(stages.valid_toc([{"title": "x", "page": 1, "depth": 0, "extra": 1}], 2), [])
 
-    def test_render_persists_png_webp_jxl_and_native_text_before_ocr(self):
+    def test_render_persists_png_jxl_and_native_text_before_ocr(self):
         result = self.render_fixture(native=True, jxl=True)
         manifest = json.loads(self.read(result["render_manifest"]))
         stages.validate_render(result, manifest)
@@ -83,13 +160,14 @@ class PdfOcrStagesTests(unittest.TestCase):
         self.assertLess(result["source_bytes"], 100 * 1024 ** 2)
         self.assertEqual(result["ocr_pages"], 1)
         for page in manifest["pages"]:
-            for field in ("i", "w", "j"):
+            self.assertNotIn('w', page)
+            for field in ("i", "j"):
                 self.read(stages.page_meta(page, field))
         native = manifest["pages"][0]
         self.assertEqual(json.loads(gzip.decompress(self.read(stages.page_meta(native, "o"))))["text"], "原生文字")
         self.assertNotIn("o", manifest["pages"][1])
 
-    def test_failed_structure_native_pdf_gets_image_stream_and_jxl(self):
+    def test_native_djvu_still_gets_complete_image_stream_and_jxl(self):
         result = self.render_fixture(native_only=True, jxl=True, force_image=True)
         manifest = json.loads(self.read(result["render_manifest"]))
         self.assertTrue(manifest["image_rendered"])
@@ -97,7 +175,8 @@ class PdfOcrStagesTests(unittest.TestCase):
         self.assertEqual(result["ocr_pages"], 0)
         self.assertIsNotNone(result["page_manifest"])
         for page in manifest["pages"]:
-            for field in ("i", "w", "j"):
+            self.assertNotIn('w', page)
+            for field in ("i", "j"):
                 self.read(stages.page_meta(page, field))
             self.assertEqual(page["source"], "native")
             self.read(stages.page_meta(page, "o"))
@@ -110,7 +189,7 @@ class PdfOcrStagesTests(unittest.TestCase):
         self.assertEqual([page["text"] for page in text["pages"]], ["原生文字", "原生文字"])
         self.assertTrue(book["stream"])
 
-    def test_old_native_range_without_images_is_not_reused(self):
+    def test_stale_pdf_force_image_flag_does_not_require_new_page_images(self):
         source = self.root / "source.pdf"
         source.write_bytes(b"%PDF-test-source")
         item = {**self.item(), "probe": {"page_count": 2, "page_chars": [60, 60],
@@ -120,7 +199,8 @@ class PdfOcrStagesTests(unittest.TestCase):
         old = {**item, "start": 1, "end": 2}
         old["force_image_render"] = False
         with patch.object(pdf_ocr, "native_pages", side_effect=lambda _source, pages: {
-                page: {"width": 200, "height": 300, "blocks": [], "text": "原生文字"}
+                page: {"width": 200, "height": 300, "blocks": [
+                    {'t': '原生文字', 'b': [.1, .1, .8, .2], 'c': 1., 's': 'native'}], "text": "原生文字"}
                 for page in pages}):
             result = stages.render_book(old, source, self.root / "old-range")
         self.store(self.root / "old-range")
@@ -128,14 +208,54 @@ class PdfOcrStagesTests(unittest.TestCase):
                     "ranges": {stages.range_id(1, 2): result["descriptor"]}}}
         with patch.object(stages, "read_object", side_effect=self.read):
             queue = stages.plan_render_ranges({"shards": [{"records": [item]}]}, progress)
-        self.assertEqual(queue["saved_ranges"], {})
-        self.assertEqual(len(queue["shards"][0]["records"]), 1)
+        self.assertTrue(queue['saved_ranges'])
+        self.assertEqual(queue['shards'], [])
+
+    def test_native_pdf_with_rejected_page_keeps_pdf_and_renders_only_ocr_input(self):
+        source = self.root / 'source.pdf'
+        source.write_bytes(b'%PDF-test-source')
+        native = {'width': 200, 'height': 300, 'text': 'positioned text',
+                  'blocks': [{'t': 'positioned text', 'b': [.1, .1, .9, .2], 's': 'native', 'c': 1.}]}
+        rejected = {**native, 'native_evidence': {'reasons': ['unverified-type3-font']}}
+        def render(_source, number, directory, reader_pixels=None, reader_jxl=False, reader_images=True):
+            self.assertEqual(number, 2)
+            self.assertFalse(reader_images)
+            self.assertFalse(reader_jxl)
+            image = directory / 'page-000002.png'
+            Image.new('L', (200, 300), 255).save(image)
+            return image, 200, 300
+        item = {**self.item(), 'probe': {'classification': 'native-text', 'page_count': 2, 'page_chars': [80, 80]}}
+        with patch.object(pdf_ocr, 'native_pages', return_value={1: native, 2: rejected}), \
+                patch.object(pdf_ocr, 'render_page', side_effect=render), patch.object(pdf_ocr, 'JXL_ENABLED', True):
+            result = stages.render_book(item, source, self.root / 'native-rejection')
+        self.store(self.root / 'native-rejection')
+        manifest = stages.validate_render(result, json.loads(self.read(result['render_manifest'])))
+        self.assertIsNone(result['page_manifest'])
+        self.assertFalse(result['image_rendered'])
+        self.assertTrue(manifest['pages'][0]['native_text_only'])
+        page = manifest['pages'][1]
+        self.assertEqual(page['native_rejection']['native_evidence'], rejected['native_evidence'])
+        self.read(stages.page_meta(page, 'i'))
+        del page['i']
+        with self.assertRaises((KeyError, ValueError)):
+            stages.validate_render(result, manifest)
+
+    def test_image_stream_cannot_hide_missing_native_page_with_text_only_flag(self):
+        result = self.render_fixture(native=True, jxl=True)
+        manifest = json.loads(self.read(result['render_manifest']))
+        page = manifest['pages'][0]
+        for field in ['j', 'i']:
+            del page[field]
+        page['native_text_only'] = True
+        with self.assertRaisesRegex(ValueError, 'incomplete reader image stream'):
+            stages.validate_render(result, manifest)
 
     def test_partial_native_text_prevents_source_pixel_cap(self):
         source = self.root / "mixed-input.pdf"
         source.write_bytes(b"%PDF-test-source")
         dimensions = []
-        def render(_source, number, directory, reader_pixels=None, reader_jxl=False):
+        def render(_source, number, directory, reader_pixels=None, reader_jxl=False, reader_images=True):
+            self.assertFalse(reader_images)
             dimensions.append(reader_pixels)
             path = directory / f"page-{number:06d}.png"
             with Image.new("RGB", (200, 300), "white") as image:
@@ -145,17 +265,18 @@ class PdfOcrStagesTests(unittest.TestCase):
         item = {**self.item(), "probe": {"classification": "scan", "page_count": 2,
                                         "page_chars": [12, 0]}}
         with patch.object(pdf_ocr, "scan_reader_images", return_value={1: (100, 150), 2: (100, 150)}), \
+                patch.object(pdf_ocr, 'native_pages', return_value={1: {
+                    'width': 200, 'height': 300, 'blocks': [], 'text': 'partial text'}}), \
                 patch.object(pdf_ocr, "render_page", side_effect=render), \
                 patch.object(pdf_ocr, "JXL_ENABLED", False):
             stages.render_book(item, source, self.root / "mixed-input-render")
-        self.assertEqual(dimensions, [None, (100, 150)])
+        self.assertEqual(dimensions, [None, None])
 
-    def test_failed_structure_native_ready_render_is_rebuilt_for_images(self):
+    def test_stale_force_image_flag_does_not_requeue_primary_pdf_for_images(self):
         item = {**self.item(), "force_image_render": True}
         previous = {**item, "status": "ready", "render_profile": stages.render_profile(),
                     "image_rendered": False}
-        self.assertEqual([x["key"] for x in stages.pending_render([item], {item["key"]: previous}, {})],
-                         [item["key"]])
+        self.assertEqual(stages.pending_render([item], {item['key']: previous}, {}), [])
         previous["image_rendered"] = True
         self.assertEqual(stages.pending_render([item], {item["key"]: previous}, {}), [])
 
@@ -223,9 +344,15 @@ class PdfOcrStagesTests(unittest.TestCase):
             page = task["pages"][0]
             root = stages.root_for(task["source_sha256"], task["key"], task["generation"] + task["profile"])
             path = (root / "ocr" / f"page-{page['p']:06d}.json.gz").as_posix()
-            raw = gzip.compress(json.dumps({**pdf_ocr.page_payload(page["p"], page["width"], page["height"],
-                                                                   [{"t": "旧"}], "ocr"),
-                                            "text_spans": [], "layout": {}}).encode(), mtime=0)
+            blocks = [{"t": "旧", "b": [.1, .1, .9, .2], "c": 1, "s": "ocr"}]
+            payload = {**pdf_ocr.page_payload(page["p"], page["width"], page["height"], blocks, "ocr"),
+                       **ocr_layout.arrange(blocks, page["width"], page["height"]),
+                       "recognition": {"policy": ocr_quality.POLICY, "profile": task["profile"],
+                           "source_sha256": task["source_sha256"], "input_sha256": page["is"],
+                           "language": "ch", "models": pdf_ocr.actual_ocr_models(),
+                           "language_evidence": {"scripts": ["Han"]}}}
+            payload["quality_check"] = ocr_quality.check_page(payload)
+            raw = gzip.compress(json.dumps(payload).encode(), mtime=0)
             with patch.object(stages, "remote_sizes", return_value={path: len(raw)}), \
                     patch.object(stages, "read_existing_object", return_value=raw), \
                     patch.object(pdf_ocr, "ocr_page", return_value=[]) as engine:
@@ -246,10 +373,10 @@ class PdfOcrStagesTests(unittest.TestCase):
         with patch.object(stages, "read_object", side_effect=self.read):
             queue = stages.plan_images({result["key"]: result}, {}, {})
             book = queue["books"][0]
-            base = book["profile"].partition("-layout-")[0]
             ready = {**{k: v for k, v in book.items() if k not in {"pages", "saved"}}, "status": "ready",
-                     "profile": base + "-layout-layout-v1-0000000000000000",
-                     "layout_options": {"default": {"rotation": 0}, "pages": {}}}
+                      "layout_options": {"default": {"rotation": 0}, "pages": {}}}
+            ready['profile'] = stages.recognition_identity(ready, ready['layout_options'])
+            self.assertEqual(ready['profile'], book['profile'])
             self.assertEqual(stages.plan_images({result["key"]: result}, {result["key"]: ready}, {})["books"], [])
             rotated = {**ready, "layout_options": {"default": {"rotation": 90}, "pages": {}}}
             self.assertEqual(len(stages.plan_images({result["key"]: result}, {result["key"]: rotated}, {})["books"]), 1)
@@ -306,7 +433,8 @@ class PdfOcrStagesTests(unittest.TestCase):
                 "probe": {"page_count": 5, "page_chars": [0] * 5, "classification": "scan"},
                 "page_count": 5, "profile": pdf_ocr.asset_profile()}
         queue = {"version": 1, "kind": "pdf-render-queue", "shards": [{"records": [item]}]}
-        def render(_source, number, directory, reader_pixels=None, reader_jxl=False):
+        def render(_source, number, directory, reader_pixels=None, reader_jxl=False, reader_images=True):
+            self.assertFalse(reader_images)
             path = directory / f"page-{number:06d}.png"
             with Image.new("RGB", (200, 300), "white") as image:
                 image.save(path)
@@ -346,10 +474,9 @@ class PdfOcrStagesTests(unittest.TestCase):
                 manifest = json.loads(self.read(result["render_manifest"]))
                 stages.validate_render(result, manifest)
                 self.assertEqual([p["p"] for p in manifest["pages"]], list(range(1, 6)))
-                self.assertEqual(manifest["page_manifest"]["version"], 2)
-                # Only the first range reads the outline; the assembled page stream carries it.
-                self.assertEqual(outline.call_count, 1)
-                self.assertEqual(json.loads(self.read(result["page_manifest"]))["toc"], toc)
+                self.assertIsNone(manifest['page_manifest'])
+                self.assertFalse(result['image_rendered'])
+                outline.assert_not_called()
                 with self.assertRaises(ValueError):
                     stages.validate_range(book, 3, 4, descriptors[stages.range_id(1, 2)])
                 self.objects[descriptors[stages.range_id(3, 4)]["path"]] = b"damaged"
@@ -380,7 +507,7 @@ class PdfOcrStagesTests(unittest.TestCase):
         prior = {**stages.range_identity({**item, "render_profile": stages.render_profile()}),
                  "ranges": {"000001-000250": {}}, "range_timings": {
                      "000001-000250": {"page_count": 250, "page_seconds": 5000, "setup_seconds": 2,
-                                          "image_rendered": True}}}
+                                           "image_rendered": False}}}
         with patch.object(stages, "render_book", side_effect=AssertionError("history skips samples")):
             self.assertEqual(stages.estimate_render_cost(item, self.root / "missing", {item["key"]: prior})["source"], "history")
         with patch.object(stages, "render_book", side_effect=ValueError("invalid page")):
@@ -423,6 +550,7 @@ class PdfOcrStagesTests(unittest.TestCase):
                 image.save(path.with_suffix(".webp"))
             return path, 20, 30
         with patch.object(pdf_ocr, "render_page", side_effect=render), patch.object(pdf_ocr, "JXL_ENABLED", False):
+            item['render_profile'] = stages.render_profile()
             old = stages.render_book({**item, "start": 1, "end": 2}, source, self.root / "old")
             self.store(self.root / "old")
             progress = {item["key"]: {**stages.range_identity(item), "ranges": {"000001-000002": old["descriptor"]}}}
@@ -477,7 +605,7 @@ class PdfOcrStagesTests(unittest.TestCase):
         self.assertEqual(set(changed["range_timings"]), {"000251-000500"})
 
     def test_render_publication_saves_partial_progress_then_only_complete_book(self):
-        previous = self.render_fixture()
+        previous = self.render_fixture(djvu=False)
         manifest = json.loads(self.read(previous["render_manifest"]))
         book = {**self.item(), "source_sha256": previous["source_sha256"],
                 "source_bytes": previous["source_bytes"], "page_count": 2,
@@ -496,8 +624,12 @@ class PdfOcrStagesTests(unittest.TestCase):
             descriptors[number] = stages.metadata(destination, range_bundle)
         self.store(range_bundle)
         updates = []
+        def registry_state(_api, _repo, name, **_kwargs):
+            return {"version": 1, "files": next(
+                (data for saved_name, data in reversed(updates) if saved_name == name), {})}
         with patch.object(stages, "RENDER_RANGE_THRESHOLD", 1), \
                 patch.object(stages, "RENDER_RANGE_PAGES", 1), \
+                patch.object(stages, "load_registry", side_effect=registry_state), \
                 patch.object(stages, "read_object", side_effect=self.read), \
                 patch.object(stages, "upload_objects", side_effect=self.store), \
                 patch.object(stages, "save_registry", side_effect=lambda api, repo, name, data, **kw:
@@ -550,7 +682,7 @@ class PdfOcrStagesTests(unittest.TestCase):
         jxl = self.render_fixture(jxl=True)
         manifest = json.loads(self.read(jxl["render_manifest"]))
         del manifest["pages"][0]["j"]
-        with self.assertRaises(KeyError):
+        with self.assertRaisesRegex(ValueError, 'incomplete reader image stream'):
             stages.validate_render(jxl, manifest)
 
     def test_read_png_uses_resolve_without_api_metadata_lookup(self):
@@ -589,6 +721,7 @@ class PdfOcrStagesTests(unittest.TestCase):
             uploads.extend(remote for _local, remote in additions)
         with patch.object(stages.shared, "batch_bucket_files_with_retry", side_effect=put), \
                 patch.object(stages, "publish_json_batch"), \
+                patch.object(stages, "remote_sha256", return_value=hashlib.sha256(local.read_bytes()).hexdigest()), \
                 patch.object(stages, "remote_sizes", side_effect=lambda bucket, prefix, token:
                              {manifest: local.stat().st_size} if bucket == stages.shared.PDF_PAGES_BUCKET else {}):
             stages.upload_objects(self.root / "render")
@@ -619,7 +752,7 @@ class PdfOcrStagesTests(unittest.TestCase):
         self.assertTrue(stages.render_partition_matches(large, "large"))
         self.assertTrue(stages.render_partition_matches(small, "all"))
 
-    def test_native_text_stream_plan_marks_pages_for_images_without_ocr(self):
+    def test_obsolete_native_text_stream_option_cannot_enable_pdf_images(self):
         item = {**self.item(), "source_bytes": 1024}
         probe = {"page_count": 2, "page_chars": [80, 80], "classification": "native-text"}
         with patch.object(plan_pdf_ocr, "download_source", return_value=self.root / "source.pdf"), \
@@ -628,7 +761,9 @@ class PdfOcrStagesTests(unittest.TestCase):
                  patch.object(pdf_ocr, "probe_pdf", return_value=probe):
             (self.root / "source.pdf").write_bytes(b"pdf")
             queue = plan_pdf_ocr.plan([item], workers=1, native_text_stream=True)
-        self.assertTrue(queue["shards"][0]["records"][0]["force_image_render"])
+        planned = queue['shards'][0]['records'][0]
+        self.assertFalse(planned.get('force_image_render', False))
+        self.assertEqual(planned['reader_presentation']['strategy'], 'preserve-pdf')
 
     def test_failed_books_do_not_starve_untouched_backlog(self):
         failed = {**self.item(), "key": "repo\0a.pdf", "path": "a.pdf"}
@@ -832,6 +967,26 @@ class PdfOcrStagesTests(unittest.TestCase):
         self.assertNotEqual(stages.generation_for(first["books"][0]), stages.generation_for(changed["books"][0]))
         self.assertEqual(first["books"][0]["render_manifest"], changed["books"][0]["render_manifest"])
 
+    def test_identical_ready_ocr_publication_is_noop(self):
+        book = {"source_sha256": "a" * 64, "source_revision": "b" * 40,
+                "source_kind": "upstream", "profile": "ocr-profile", "page_count": 12,
+                "page_manifest": {"path": "pages/manifest.json", "sha256": "c" * 64, "bytes": 12}}
+        previous = {**book, "status": "ready"}
+        self.assertTrue(stages.ocr_publication_is_current(previous, book))
+        self.assertFalse(stages.ocr_publication_is_current(previous, {**book, "profile": "changed"}))
+
+
+    def test_same_source_ignores_revision_drift_for_identical_bytes(self):
+        base = {"source_sha256": "a" * 64, "source_kind": "upstream", "reader_assets_path": None}
+        previous = {**base, "source_revision": "old"}
+        current = {**base, "source_revision": "new"}
+        self.assertTrue(stages.same_source(previous, current))
+        self.assertFalse(stages.same_source({**previous, "source_sha256": "b" * 64}, current))
+        legacy_previous = {"source_kind": "upstream", "reader_assets_path": None,
+                           "source_revision": "old"}
+        self.assertTrue(stages.same_source(legacy_previous, {**legacy_previous, "source_revision": "old"}))
+        self.assertFalse(stages.same_source(legacy_previous, {**legacy_previous, "source_revision": "new"}))
+
     def test_unprobed_render_sources_reuse_only_pinned_matching_lfs_sha_before_limit(self):
         from types import SimpleNamespace
         def source(name):
@@ -898,24 +1053,88 @@ class PdfOcrStagesTests(unittest.TestCase):
             self.assertEqual(stages.main(), 0)
         self.assertEqual(plan.call_args.args[0], [fresh])
 
-    def test_same_source_ignores_revision_drift_for_identical_bytes(self):
-        base = {"source_sha256": "a" * 64, "source_kind": "upstream", "reader_assets_path": None}
-        previous = {**base, "source_revision": "old"}
-        current = {**base, "source_revision": "new"}
-        self.assertTrue(stages.same_source(previous, current))
-        self.assertFalse(stages.same_source({**previous, "source_sha256": "b" * 64}, current))
-        self.assertFalse(stages.same_source({**previous, "source_kind": "generated"}, current))
-        legacy = {"source_kind": "upstream", "reader_assets_path": None, "source_revision": "old"}
-        self.assertTrue(stages.same_source(legacy, legacy))
-        self.assertFalse(stages.same_source(legacy, {**legacy, "source_revision": "new"}))
+    def test_same_size_json_descriptor_is_checked_by_sha(self):
+        descriptor = self.root / "render-range-000001-000010.json"
+        descriptor.write_bytes(b"{}")
+        with patch.object(stages, "remote_sizes", return_value={descriptor.name: 2}), \
+                patch.object(stages, "remote_sha256", return_value="0" * 64):
+            with self.assertRaisesRegex(ValueError, "immutable object conflict"):
+                stages.fresh_additions("bucket", "objects/x", [(str(descriptor), descriptor.name)], "token")
+        with patch.object(stages, "remote_sizes", return_value={descriptor.name: 2}), \
+                patch.object(stages, "remote_sha256", return_value=hashlib.sha256(b"{}").hexdigest()):
+            self.assertEqual(stages.fresh_additions("bucket", "objects/x",
+                                                    [(str(descriptor), descriptor.name)], "token"), [])
 
-    def test_identical_ready_ocr_publication_is_noop(self):
-        book = {"source_sha256": "a" * 64, "source_revision": "b" * 40,
-                "source_kind": "upstream", "profile": "ocr-profile", "page_count": 12,
-                "page_manifest": {"path": "pages/manifest.json", "sha256": "c" * 64, "bytes": 12}}
-        previous = {**book, "status": "ready"}
-        self.assertTrue(stages.ocr_publication_is_current(previous, book))
-        self.assertFalse(stages.ocr_publication_is_current(previous, {**book, "profile": "changed"}))
+    def test_ready_render_supersedes_revision_only_replay(self):
+        book = {"key": "repo\0book.djvu", "source_sha256": "a" * 64,
+                "source_revision": "new", "source_kind": "upstream",
+                "reader_assets_path": None, "render_profile": "profile", "page_count": 10}
+        ready = {**book, "status": "ready", "source_revision": "old"}
+        self.assertTrue(stages.render_result_is_current(ready, book))
+        self.assertFalse(stages.render_result_is_current({**ready, "page_count": 11}, book))
+        self.assertFalse(stages.render_result_is_current({**ready, "render_profile": "other"}, book))
+        self.assertFalse(stages.render_result_is_current({**ready, "status": "failed"}, book))
+
+    def test_recorded_unreadable_source_keeps_its_derived_stream(self):
+        exception = {"key": "repo\0book.djvu", "missing_source_pages": [330],
+                     "source_page_count": 731, "derived_page_count": 730}
+        native = {"key": "repo\0book.djvu", "repo": "repo", "path": "book.djvu",
+                  "source_format": "djvu", "source_kind": "upstream"}
+        with patch.object(stages.djvu_pages, "native_exceptions", return_value={native["key"]: exception}):
+            self.assertIs(stages.djvu_pages.native_exception(native), exception)
+            # The recorded exception never becomes a native render task.
+            self.assertEqual(stages.pending_render([native], {}, {}), [])
+
+    def test_native_text_only_book_keeps_an_assembly_only_queue(self):
+        result = self.render_fixture(native_only=True)
+        with patch.object(stages, "read_object", side_effect=self.read):
+            queue = stages.plan_images({result["key"]: result}, {}, {})
+        self.assertEqual(queue["shard_count"], 0)
+        self.assertEqual(len(queue["books"]), 1)
+        self.assertEqual(queue["books"][0]["key"], result["key"])
+        self.assertEqual(sum(len(task["pages"]) for task in queue["shards"]), 0)
+
+    def test_worker_and_publisher_admit_zero_shard_native_text_assembly(self):
+        root = Path(__file__).resolve().parents[1] / ".github/workflows"
+        worker = yaml.safe_load((root / "pdf-account-worker.yml").read_text())
+        self.assertIn("book_count", worker["jobs"]["plan"]["outputs"])
+        plan_commands = "\n".join(step.get("run", "") for step in worker["jobs"]["plan"]["steps"])
+        self.assertIn("book_count=$(jq -r '(.books // []) | length'", plan_commands)
+        self.assertIn('"$STAGE" == auto', plan_commands)
+        self.assertIn('output/pdf-ocr/queue.json)" == 0', plan_commands)
+        self.assertIn("(.books // []) | length", plan_commands)
+        notify = worker["jobs"]["notify"]["if"]
+        self.assertIn("needs.plan.outputs.shard_count != '0'", notify)
+        self.assertIn("needs.plan.outputs.book_count != '0'", notify)
+        if not (root / 'pdf-account-publish.yml').exists():
+            # Account repositories intentionally carry only the worker. Their
+            # notify step delegates assembly to the central publisher.
+            self.assertIn('pdf-account-publish.yml', worker['jobs']['notify']['steps'][0]['run'])
+            return
+        publisher = yaml.safe_load((root / "pdf-account-publish.yml").read_text())
+        conditions = "\n".join(step.get("if", "") for step in publisher["jobs"]["publish"]["steps"])
+        self.assertIn("inputs.stage == 'render' || inputs.stage == 'ocr'", conditions)
+
+    def test_native_djvu_renders_before_other_converted_formats(self):
+        native = {"key": "repo\0z.djvu", "repo": "repo", "path": "z.djvu", "source_format": "djvu",
+                  "source_kind": "upstream"}
+        other = {"key": "repo\0a.caj", "repo": "repo", "path": "a.caj", "source_kind": "generated"}
+        self.assertEqual([x["key"] for x in stages.pending_render([other, native], {}, {})],
+                         ["repo\0z.djvu", "repo\0a.caj"])
+
+    def test_pinned_native_keys_restrict_plan_and_reject_fallbacks(self):
+        native = {"key": "repo\0b.djvu", "repo": "repo", "path": "b.djvu",
+                  "source_format": "djvu", "source_bytes": 10}
+        other = {**native, "key": "repo\0a.djvu", "path": "a.djvu"}
+        with patch.object(stages.djvu_pages, "native_enabled", return_value=True):
+            self.assertEqual([x["key"] for x in stages.pin_render_records(
+                [other, native], ["repo/b.djvu"])], ["repo\0b.djvu"])
+            with self.assertRaisesRegex(ValueError, "not in this lane"):
+                stages.pin_render_records([native], ["repo/missing.djvu"])
+            with self.assertRaisesRegex(ValueError, "not an admitted native DjVu"):
+                stages.pin_render_records([{**native, "source_format": "pdf"}], ["repo/b.djvu"])
+        self.assertEqual(stages.pinned_keys("repo/a.djvu|repo/b.djvu\nrepo/c.djvu"),
+                         ["repo/a.djvu", "repo/b.djvu", "repo/c.djvu"])
 
 
 if __name__ == "__main__":

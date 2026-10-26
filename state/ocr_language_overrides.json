@@ -1,6 +1,26 @@
 {
  "kind": "ocr-language-overrides",
  "overrides": {
+  "VoiceOfML/MLMRL-Library\u0000安全培训/维基备份/软件/综合性资料/编程随想的博客/政治（含大量禁书）/政治/政治理论/共产主义/雅诺什·科尔奈：The Socialist System——The Political Economy of Communism (扫描版).djvu": {
+   "evidence": {
+    "script": "Latin",
+    "source_sha256": "97211a0c95f226a77c4e21459556a95bc10222b3b856e2cad00d13d1c03b86c8",
+    "physical_pages": [1, 17, 26, 168, 182, 312],
+    "basis": "Original title, English tables and bibliography; preserve János Kornai and all printed diacritics"
+   },
+   "language": "en",
+   "source": "source-image-review-20261025"
+  },
+  "VoiceOfML/GPCREducation\u0000化学/0、中学化学教材/化学式和化学方程式.pdf": {
+   "evidence": {
+    "script": "Han",
+    "source_sha256": "215c50e18150b558b9d5bbd1f6d27300722dd7333bf4d8203f212be7c9065990",
+    "physical_pages": [1, 13, 55, 56],
+    "basis": "Original Chinese chemistry text and mixed formula pages; formula-only Latin symbols are not Russian prose"
+   },
+   "language": "ch",
+   "source": "source-image-review-20261025"
+  },
   "VoiceOfML/GPCREducation\u0000《自然辩证法》杂志/1976年/自然辩证法杂志 1976年第1期.pdf": {
    "evidence": {
     "script": "Han",
@@ -21,18 +41,6 @@
    "language": "ch",
    "source": "osd-triage-full-v1"
   },
-  "VoiceOfML/GPCREducation\u0000化学/1、農业化学/農药工业/農药工业 國外部分 下.pdf": {
-   "evidence": {
-    "script": "Cyrillic",
-    "votes": {
-     "Cyrillic": 1,
-     "Han": 1,
-     "Latin": 1
-    }
-   },
-   "language": "ru",
-   "source": "osd-triage-full-v1"
-  },
   "VoiceOfML/GPCREducation\u0000化学/2、工业化学/半导体化学/衬底制备.pdf": {
    "evidence": {
     "chars": 53595,
@@ -41,17 +49,6 @@
    },
    "language": "ch",
    "source": "text-triage-v1"
-  },
-  "VoiceOfML/GPCREducation\u0000化学/2、工业化学/热处理化学 （下册）.pdf": {
-   "evidence": {
-    "script": "Cyrillic",
-    "votes": {
-     "Cyrillic": 1,
-     "Han": 1
-    }
-   },
-   "language": "ru",
-   "source": "osd-triage-full-v1"
   },
   "VoiceOfML/GPCREducation\u0000化学/2、工业化学/英汉化学化工词汇补编 涂料部分.pdf": {
    "evidence": {
@@ -62,17 +59,6 @@
     }
    },
    "language": "en",
-   "source": "osd-triage-full-v1"
-  },
-  "VoiceOfML/GPCREducation\u0000化学/2、工业化学/钢铁化学/钢铁原材料化学分析.pdf": {
-   "evidence": {
-    "script": "Cyrillic",
-    "votes": {
-     "Cyrillic": 1,
-     "Han": 1
-    }
-   },
-   "language": "ru",
    "source": "osd-triage-full-v1"
   },
   "VoiceOfML/GPCREducation\u0000化学/化学专业基础词汇 日英汉对照.pdf": {
@@ -2033,6 +2019,16 @@
    "language": "japan",
    "source": "osd+text-v1"
   },
+  "VoiceOfML/Japanese-Materials\u0000日本资本主义论争群像（战前·战时）.pdf": {
+   "evidence": {
+    "script": "Japanese",
+    "source_sha256": "c1f658ec808976a3f911cf0cca85a6241699d0832ec0b17111131f1307e27cb6",
+    "physical_pages": [10, 166],
+    "basis": "Original spread images: vertical Japanese prose and chronological tables; confirmed kana and right-to-left printed page order"
+   },
+   "language": "japan",
+   "source": "source-image-review-20261025"
+  },
   "VoiceOfML/Japanese-Materials\u0000日本资本主义论争史.pdf": {
    "evidence": {
     "chars": 248369,
@@ -3767,6 +3763,6 @@
    "source": "osd+text-v1"
   }
  },
- "policy": "exact-key overrides corroborated by OSD script probes and, for CJK, by kana/Han ratios in published text",
+ "policy": "exact-key overrides; Cyrillic requires 2+ OSD votes or text corroboration, CJK requires kana/Han share",
  "version": 1
 }

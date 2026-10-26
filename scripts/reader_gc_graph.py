@@ -95,7 +95,7 @@ def decode(raw: bytes) -> dict:
 class ReferenceGraph:
     def __init__(self, store, include_input: bool = True, generation_grace_days: int = 0,
                  progress=None, workers: int = 8, max_rounds: int = 20, full_passes: int = 3,
-                 deadline: float | None = None):
+                 deadline: float | None = None, processing_supersessions=None):
         self.store = store
         self.include_input = include_input
         self.files = {}
@@ -113,6 +113,7 @@ class ReferenceGraph:
         self.retired_roots = set()
         self.retired_inputs = set()
         self.retired_input_roots = set()
+        self.ignored_retired_pins = set()
         self.progress = progress or (lambda *args, **kwargs: None)
         self.workers = max(1, workers)
         self.max_rounds = max(1, max_rounds)
@@ -134,9 +135,12 @@ class ReferenceGraph:
         self.root_names = {}
         self.expected_resources = {}
         self.loaded_digests = {}
+        self.resource_warnings = []
         self.external_pins = set()
         self.externally_traversed = set()
         self.active_external_pin = False
+        self.released_processing = {}
+        self.processing_supersessions = processing_supersessions or {}
 
     def read_catalog(self, ref):
         parser = functools.partial(catalog_json, grace_days=self.generation_grace_days)
@@ -171,6 +175,23 @@ class ReferenceGraph:
                 self.fingerprints[ref] = ("etag", etag) if etag else ("sha256", digest)
         return payload
 
+    def note_checksum(self, ref, expected) -> bool:
+        """Record a retained-resource drift; only runtime roles block.
+
+        Provenance bytes (a converted document manifest) are advisory: the
+        export's text and document identity are verified independently, so a
+        rewritten manifest must not mark the whole graph incomplete.
+        """
+        # Only Reader-sidecar provenance is advisory. Anything inside the CCRD
+        # bucket is an authoritative lifecycle document: a checksum mismatch
+        # there can hide a corrupted release and must fail closed.
+        if expected.get("role") == "provenance" and ref[0] != ccrd_lifecycle.BUCKET:
+            with self.lock:
+                self.resource_warnings.append(f"provenance checksum drifted: {ref[0]}:{ref[1]}")
+            return False
+        self.blockers.add(f"retained resource checksum mismatch: {ref[0]}:{ref[1]}")
+        return True
+
     def handoff_resolved(self, generation) -> bool:
         return isinstance(generation, str) and (
             generation in self.catalog_ids or generation in self.retired_acked)
@@ -197,6 +218,17 @@ class ReferenceGraph:
                     or item.get("bucket") != PDF_OCR_INPUT_BUCKET or item.get("source_sha256") != match[1]):
                 self.blockers.add("invalid retired OCR input root")
             else:
+                released_at = item.get('released_at')
+                if released_at:
+                    try:
+                        released = datetime.fromisoformat(str(released_at).replace('Z', '+00:00'))
+                        if released.tzinfo is None:
+                            raise ValueError('release time needs timezone')
+                    except ValueError:
+                        self.blockers.add('invalid retired OCR input release time')
+                        continue
+                    if datetime.now(timezone.utc) - released < timedelta(days=30):
+                        continue
                 self.retired_input_roots.add(root)
         for path in state["retired_paths"]:
             if not isinstance(path, str) or not re.fullmatch(
@@ -212,6 +244,7 @@ class ReferenceGraph:
             self.externally_traversed.add(ref)
         self.direct[ref] = set()
         self.handoffs.pop(ref, None)
+        self.released_processing.pop(ref, None)
         try:
             if not self.validate(payload, *ref):
                 return
@@ -298,8 +331,10 @@ class ReferenceGraph:
             if len(matches) > 1:
                 self.ambiguous.add(value)
             if not matches:
-                if "/ocr-input/" in value or value.lower().endswith(".jxl"):
+                if "/ocr-input/" in value:
                     bucket = PDF_OCR_INPUT_BUCKET
+                elif value.lower().endswith('.jxl'):
+                    bucket = PDF_PAGES_BUCKET
                 self.mark(bucket, value, tree=field == "root")
             for candidate in matches:
                 self.mark(candidate, value, tree=field == "root")
@@ -318,7 +353,7 @@ class ReferenceGraph:
                     continue
                 self.expected_resources[key] = ref
                 if key in self.loaded_digests and self.loaded_digests[key] != ref['sha256']:
-                    self.blockers.add(f"retained resource checksum mismatch: {key[0]}:{key[1]}")
+                    self.note_checksum(key, ref)
                 self.mark(*key, external_pin=True)
             return
         if isinstance(value, dict):
@@ -347,10 +382,30 @@ class ReferenceGraph:
                     if isinstance(generation, dict) and reader_lifecycle.generation_live(
                             generation, current, grace_days=self.generation_grace_days):
                         self.walk(generation, bucket, origin, explicit, "generation")
+                for entry in (value.get('retired_generations') or {}).values():
+                    if (isinstance(entry, dict) and entry.get('withdrawal_reset_id')
+                            and entry.get('replacement_acks') != ACKED and entry.get('snapshot')):
+                        self.walk(entry['snapshot'], bucket, origin, explicit, 'snapshot')
                 return
             if origin.startswith("reader-index/processing/") and value.get("status") == "released":
                 generation = value.get("generation")
-                if self.handoff_resolved(generation):
+                supersession = self.processing_supersessions.get((bucket, origin))
+                if supersession:
+                    current = self.catalog.get('current', {}).get('generation')
+                    accepted = self.catalog.get('generations', {}).get(current, {})
+                    if (supersession.get('record_sha256') != self.loaded_digests.get((bucket, origin))
+                            or supersession.get('original_generation') != generation
+                            or supersession.get('replacement_generation') != current
+                            or supersession.get('sidecar_sha256') != accepted.get('sidecar_sha256')):
+                        self.blockers.add(f"processing supersession identity changed: {bucket}:{origin}")
+                        supersession = None
+                if self.handoff_resolved(generation) or supersession:
+                    if value.get('kind') == 'reader-processing-roots':
+                        self.released_processing[self.origin or (bucket, origin)] = {
+                            'generation': generation, 'sha256': self.loaded_digests.get((bucket, origin)),
+                            'operation': value.get('operation'), 'run': value.get('run'),
+                            'released_at': value.get('released_at'),
+                            **({'supersession': supersession} if supersession else {})}
                     return
                 # Resolve against every catalog version read during the scan;
                 # until then the root's resources stay protected.
@@ -379,8 +434,11 @@ class ReferenceGraph:
                     target = value.get("b")
                 if key == "p" and isinstance(value.get("b"), str):
                     target = value["b"]
-                if key in {"i", "j"} and isinstance(item, str) and not target:
+                if key == 'i' and isinstance(item, str) and not target:
                     target = PDF_OCR_INPUT_BUCKET
+                if key == 'j' and isinstance(item, str) and not target:
+                    matches = [b for b in (PDF_PAGES_BUCKET, PDF_OCR_INPUT_BUCKET) if item in self.files.get(b, set())]
+                    target = matches[0] if len(matches) == 1 else PDF_PAGES_BUCKET
                 if isinstance(target, str):
                     if target not in BUCKETS:
                         self.blockers.add(f"unsupported reference bucket: {target}")
@@ -398,8 +456,8 @@ class ReferenceGraph:
         ref = (bucket, path)
         expected = self.expected_resources.get(ref)
         if expected and self.loaded_digests.get(ref) != expected['sha256']:
-            self.blockers.add(f"retained resource checksum mismatch: {bucket}:{path}")
-            return False
+            if self.note_checksum(ref, expected):
+                return False
         if bucket == ccrd_lifecycle.BUCKET:
             try:
                 ccrd_lifecycle.references(payload, path)
@@ -527,8 +585,12 @@ class ReferenceGraph:
                     return False
                 if payload["kind"] == "pdf-pages":
                     root = posixpath.dirname(path)
+                    codec = payload.get('codec', 'webp')
+                    if codec not in {'webp', 'jxl'}:
+                        self.blockers.add(f"unknown page codec: {bucket}:{path}")
+                        return False
                     for number in range(1, count + 1):
-                        self.mark(bucket, f"{root}/pages/page-{number:06d}.webp")
+                        self.mark(bucket, f"{root}/pages/page-{number:06d}.{codec}")
         return True
 
     def inventory(self, bucket):
@@ -603,7 +665,8 @@ class ReferenceGraph:
 
     def list_roots(self, bucket):
         if bucket == ccrd_lifecycle.BUCKET:
-            return {path for path in self.store.list_files(bucket, ("",)) if is_root(path, bucket)}
+            return {path for path in self.store.list_files(bucket, ('control/', 'current.json'))
+                    if is_root(path, bucket)}
         if hasattr(self.store, "list_roots"):
             parents = {posixpath.dirname(path) + "/" for path in self.root_names.get(bucket, set())
                        if not path.startswith("reader-index/") and "/" in path}
@@ -686,14 +749,27 @@ class ReferenceGraph:
         return False
 
     def finalize(self):
+        # A completed handoff lets the accepted catalog own the resources. Keep
+        # the small audit in the collection plan; retire old processing records
+        # across every format instead of repeatedly scanning them forever.
+        explicit = set().union(*self.direct.values()) if self.direct else set()
+        for ref in self.released_processing:
+            if ref not in self.external_pins and ref not in explicit:
+                self.retired_roots.add(ref)
+                self.references.discard(ref)
         def alive(ref):
             if ref in self.retired_roots and ref not in self.external_pins:
                 return False
             if is_root(ref[1], ref[0]):
                 return ref[1] in self.root_names.get(ref[0], set())
             return ref[1] in self.files.get(ref[0], set())
+        # A journaled OCR input root is a deliberate deletion, not a missing
+        # reference. Older catalogs and CCRD releases may still pin those PNGs;
+        # the journal supersedes them, so a stale pin must never block the graph.
+        self.ignored_retired_pins = {ref for origin, refs in self.direct.items()
+                                     for ref in refs if self.input_retired(ref)}
         self.missing = {ref for origin, refs in self.direct.items() if alive(origin)
-                        for ref in refs if (not self.input_retired(ref) or ref in self.external_pins)
+                         for ref in refs if (not self.input_retired(ref) or ref in self.external_pins)
                         and ref[0] in self.files and ref[1] not in self.files[ref[0]]}
         for ref, message in self.unreadable.items():
             if alive(ref):
@@ -784,10 +860,14 @@ class ReferenceGraph:
                            "references from earlier root versions unioned conservatively",
             "scanned_at": datetime.now(timezone.utc).isoformat(),
             "deletion_enabled": False,
+            "warnings": sorted(set(self.resource_warnings)),
             "deletion_blockers": ["remaining producers lack shared mutation coordination"],
             "blockers": sorted(self.blockers), "buckets": buckets,
             "missing": [f"{b}:{p}" for b, p in sorted(self.missing)],
             "ambiguous_paths": sorted(self.ambiguous),
+            "processing_retirements": [{"bucket": bucket, "path": path, **evidence}
+                for (bucket, path), evidence in sorted(self.released_processing.items())
+                if (bucket, path) in self.retired_roots and (bucket, path) not in self.references],
             "roots": [f"{b}:{p}" for b, p in sorted(self.root_hashes)],
         }
 

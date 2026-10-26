@@ -74,6 +74,8 @@ def add_pdf_streams(files: dict, payload: dict, bucket: str) -> None:
     for key, entry in payload.get("files", {}).items():
         if not isinstance(entry, dict) or entry.get("status") not in {"ready", "rendered"}:
             continue
+        if entry.get('source_format') != 'djvu':
+            continue
         page_manifest = entry.get("page_manifest")
         path = page_manifest.get("path") if isinstance(page_manifest, dict) else ""
         if isinstance(path, str) and path.endswith("/page-manifest.json"):
@@ -87,13 +89,21 @@ def release_processing_roots(indexes: list[dict], generation: str, read, publish
     updates = reader_lifecycle.processing_handoffs(results, generation, read)
     for path, record in updates.items():
         publish(path, record)
-    return len(updates)
+    return sum(path.startswith('reader-index/processing/') for path in updates)
 
 
 def ebook_chapter_indexes(assets_bucket: str) -> list[tuple[str, str]]:
     """Return every canonical ebook chapter index that can own upload roots."""
     return [(assets_bucket, f"chapters/ebook/{extension}/index.json")
             for extension in EBOOK_EXTENSIONS]
+
+
+def stream_processing_indexes(assets_bucket: str) -> list[tuple[str, str]]:
+    return [(assets_bucket, f"documents/{family}/{extension}/index.json")
+            for family, extensions in (("web", ("html", "htm", "mht", "mhtml")),
+                                       ("spreadsheet", ("xls", "xlsx", "csv", "ods")))
+            for extension in extensions] + [(assets_bucket, f"media/{kind}/index.json")
+                                           for kind in ("audio", "video", "swf")]
 
 
 def build(fs: HfFileSystem, assets_bucket: str, pdf_bucket: str, derived_path: str,
@@ -125,19 +135,49 @@ def build(fs: HfFileSystem, assets_bucket: str, pdf_bucket: str, derived_path: s
         except FileNotFoundError:
             continue
         add_index(files, payload, {extension: "h"}, assets_bucket)
-    for extension in ("ppt", "pptx", "pps", "wps", "ps"):
-        payload = read_json(fs, assets_bucket, f"documents/pdf/{extension}/index.json")
+    for extension in ("ppt", "pptx", "pps", "wps", "ps", "tif", "tiff"):
+        try:
+            payload = read_json(fs, assets_bucket, f"documents/pdf/{extension}/index.json")
+        except FileNotFoundError:
+            continue
         add_index(files, payload, {extension: "p"}, assets_bucket)
     for extension in ("epub", "mobi", "azw3", "fb2", "chm"):
         payload = read_json(fs, assets_bucket, f"chapters/ebook/{extension}/index.json")
         add_index(files, payload, {extension: "e"}, assets_bucket, chapters=True)
-    image_payload = read_json(fs, assets_bucket, "pages/image/index.json")
+    old_image_payload = None
+    try:
+        old_image_payload = read_json(fs, assets_bucket, "pages/image/index.json")
+    except FileNotFoundError:
+        pass
+    try:
+        image_payload = read_json(fs, assets_bucket, "pages/image/index-v2.json")
+    except FileNotFoundError:
+        # Transitional only: the v2 index is built by a full image rebuild. Until
+        # it exists, keep serving the old page-stream index so other format
+        # publishes do not remove every image from the sidecar.
+        if old_image_payload is None:
+            raise
+        image_payload = old_image_payload
     for entry in image_payload.get("files", []):
         if not isinstance(entry, dict) or not entry.get("key"):
             continue
-        manifest = entry.get("manifest")
-        if isinstance(manifest, str):
-            files[entry["key"]] = {"s": 2, "m": "i", "p": manifest, "b": assets_bucket}
+        path = entry.get("path") if entry.get("mode") == "image" else None
+        if not isinstance(path, str):
+            path = entry.get("manifest")
+        if isinstance(path, str):
+            files[entry["key"]] = {"s": 2, "m": "i", "p": path, "b": assets_bucket}
+    # Legacy TIF/TIFF PDF conversions are still indexed until the image rebuild
+    # replaces every one of them with a single image or an image-page-stream.
+    # Image entries are written above, so they always win for the same key.
+    if old_image_payload is not None:
+        for entry in old_image_payload.get("files", []):
+            if not isinstance(entry, dict) or not entry.get("key") or entry["key"] in files:
+                continue
+            if str(entry.get("extension") or "").lower() not in {"tif", "tiff"}:
+                continue
+            manifest = entry.get("manifest")
+            if isinstance(manifest, str):
+                files[entry["key"]] = {"s": 2, "m": "i", "p": manifest, "b": assets_bucket}
     for kind, mode in (("audio", "a"), ("video", "v"), ("swf", "f")):
         payload = read_json(fs, assets_bucket, f"media/{kind}/index.json")
         for entry in payload.get("files", []):
@@ -145,7 +185,8 @@ def build(fs: HfFileSystem, assets_bucket: str, pdf_bucket: str, derived_path: s
                 continue
             object_path = entry.get("object")
             if isinstance(object_path, str):
-                files[entry["key"]] = {"s": 2, "m": mode, "p": object_path, "b": assets_bucket}
+                actual_mode = {"audio": "a", "video": "v", "swf": "f"}.get(entry.get("mode"), mode)
+                files[entry["key"]] = {"s": 2, "m": actual_mode, "p": object_path, "b": assets_bucket}
 
     for index_path in (render_path, ocr_path):
         try:
@@ -187,6 +228,7 @@ def main() -> int:
         indexes = []
         for bucket, path in [(args.pdf_bucket, args.derived_manifest),
                              (args.assets_bucket, "documents/text/index.json"),
+                             *stream_processing_indexes(args.assets_bucket),
                              *ebook_chapter_indexes(args.assets_bucket)]:
             try:
                 payload = read_bucket_json(path, token, bucket=bucket)

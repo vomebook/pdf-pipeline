@@ -200,6 +200,10 @@ class RealDjvuTests(unittest.TestCase):
                 fallback = plan_pdf_ocr.plan([{**self.item(), "_derived_fallback": derived}], workers=1)
                 book = fallback["shards"][0]["records"][0]
                 self.assertEqual((book["source_kind"], book["djvu_pdf_fallback"]), ("generated", "pdf-magic"))
+                self.assertIsNone(book.get("worker_lane"))
+                routed = plan_pdf_ocr.plan([{**self.item(), "worker_lane": "converted",
+                                             "_derived_fallback": derived}], workers=1)
+                self.assertEqual(routed["shards"][0]["records"][0]["worker_lane"], "converted")
                 failed = plan_pdf_ocr.plan([self.item()], workers=1)
                 self.assertIn("awaits its derived PDF", failed["failed"][0]["error"])
 
@@ -240,7 +244,7 @@ class RealDjvuTests(unittest.TestCase):
         for path in bundle.rglob("*"):
             if path.is_file():
                 self.objects[(shared.PDF_PAGES_BUCKET, path.relative_to(bundle).as_posix())] = path.read_bytes()
-        self.assertEqual([p["codec"] for p in spec["previews"]], ["png", "webp"])
+        self.assertEqual([p["codec"] for p in spec["previews"]], ["png", "jxl"])
         bitonal = self.objects[(shared.PDF_PAGES_BUCKET, spec["previews"][0]["resource"]["path"])]
         with Image.open(__import__("io").BytesIO(bitonal)) as image, Image.open(self.root / "p1.pbm") as original:
             self.assertEqual(image.mode, "1")

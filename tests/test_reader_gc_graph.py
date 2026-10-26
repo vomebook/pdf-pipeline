@@ -17,6 +17,7 @@ from scripts import pdf_ocr_stages as stages
 
 
 ASSETS, PDF, INPUT = gc.READER_BUCKETS
+CCRD = gc.ccrd_lifecycle.BUCKET
 SIDECAR = "reader-index/reader_assets.json.gz"
 
 
@@ -85,6 +86,39 @@ class ReaderGcGraphTests(unittest.TestCase):
         self.assertTrue(report["graph_complete"], report["blockers"])
         self.assertEqual(sorted(report["buckets"][INPUT]["candidates"]),
                          [f"{root}/page-000001.png", f"{root}/page-000002.png"])
+
+    def test_provenance_drift_warns_but_does_not_block(self):
+        graph = gc.ReferenceGraph(MemoryStore())
+        ref = (ASSETS, "documents/pdf/pptx/" + "a" * 64 + "/document-manifest.json")
+        blocked = graph.note_checksum(ref, {"role": "provenance"})
+        self.assertFalse(blocked)
+        self.assertEqual(graph.blockers, set())
+        self.assertTrue(any("provenance checksum drifted" in w for w in graph.resource_warnings))
+
+    def test_runtime_drift_still_blocks(self):
+        graph = gc.ReferenceGraph(MemoryStore())
+        ref = (ASSETS, "documents/pdf/pptx/" + "a" * 64 + "/document-manifest.json")
+        blocked = graph.note_checksum(ref, {"role": "runtime"})
+        self.assertTrue(blocked)
+        self.assertIn("retained resource checksum mismatch", " ".join(graph.blockers))
+
+    def test_stale_pin_of_retired_input_is_not_a_missing_reference(self):
+        store = MemoryStore()
+        source = "a" * 64
+        root = f"objects/aa/{source}/{'b' * 16}/ocr-input"
+        path = f"{root}/page-000001.png"
+        # The PNG is already collected, but an older manifest still names it.
+        store.put(ASSETS, "reader-index/v3/retirement.json", {
+            "version": 1, "kind": "reader-v3-retirement", "resources": [], "retired_paths": [],
+            "replacement_acks": {"hf": True, "pages": True}, "retired_input_roots": {root: {
+                "bucket": INPUT, "root": root, "source_sha256": source, "pages": 1}}})
+        store.put(PDF, "objects/aa/" + "c" * 64 + "/" + "d" * 16 + "/ocr-manifest.json", {
+            "version": 1, "kind": "pdf-ocr", "complete": True, "page_count": 1,
+            "source_sha256": "c" * 64, "profile": "p", "pages": [
+                {"p": 1, "source": "ocr", "i": path, "o": "objects/x.json.gz"}]})
+        report = gc.ReferenceGraph(store).build()
+        self.assertEqual(report["missing"], [])
+        self.assertNotIn("referenced objects are missing", report["blockers"])
 
     def test_retired_input_with_open_review_evidence_is_collectible(self):
         store = MemoryStore()
@@ -694,17 +728,27 @@ class ReaderGcGraphTests(unittest.TestCase):
 
 class CanonicalOcrPublicationTests(unittest.TestCase):
     def test_ready_publication_verifies_manifest_text_checksums_and_page_order(self):
+        from scripts import ocr_quality
         root = "objects/aa/" + "a" * 64 + "/" + "b" * 16
+        check = ocr_quality.book_report([{"page": n, "issues": []} for n in (1, 2)], 2)
+        pages = []
+        raw_pages = []
+        for n in (1, 2):
+            raw = gzip.compress(json.dumps({"kind": "pdf-ocr-page", "page": n, "source": "native"}).encode())
+            raw_pages.append(raw)
+            pages.append({"p": n, "source": "native", "o": root + f"/ocr/page-{n:06d}.json.gz",
+                          "os": hashlib.sha256(raw).hexdigest(), "ob": len(raw)})
         text_path = root + "/ocr/book-text.json.gz"
         text = gzip.compress(json.dumps({"kind": "pdf-book-text", "version": 2,
-            "complete": True, "page_count": 2, "pages": [{"page": 1}, {"page": 2}]}).encode())
+            "complete": True, "page_count": 2, "quality_check": check, "pages": [{"page": 1}, {"page": 2}]}).encode())
         manifest = json.dumps({"kind": "pdf-ocr", "complete": True, "page_count": 2,
-            "source_sha256": "a" * 64, "pages": [{"p": 1}, {"p": 2}], "book_text": {
+            "source_sha256": "a" * 64, "quality_check": check, "pages": pages, "book_text": {
                 "path": text_path, "bytes": len(text), "sha256": hashlib.sha256(text).hexdigest()}}).encode()
         result = {"ocr_manifest": root + "/ocr-manifest.json", "page_count": 2,
-            "source_sha256": "a" * 64, "ocr_manifest_bytes": len(manifest),
+            "source_sha256": "a" * 64, "quality_check": check, "ocr_manifest_bytes": len(manifest),
             "ocr_manifest_sha256": hashlib.sha256(manifest).hexdigest()}
-        with patch.object(publication, "read_bucket_bytes", side_effect=[manifest, text]) as read:
+        objects = {result["ocr_manifest"]: manifest, text_path: text, **dict(zip([p["o"] for p in pages], raw_pages))}
+        with patch.object(publication, "read_bucket_bytes", side_effect=lambda path, token, bucket: objects[path]) as read:
             publication.verify_ready_objects(result)
         self.assertTrue(all(call.kwargs["bucket"] == PDF for call in read.call_args_list))
         malformed = json.loads(manifest)

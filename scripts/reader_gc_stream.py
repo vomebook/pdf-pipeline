@@ -55,6 +55,7 @@ def graph_json(chunks, compressed=False):
         elif event == "map_key" and value == "text" and not prefix:
             possible_text_resource = True
         elif (event == "map_key" and value in SKIP_FIELDS
+              and not (value == 'source' and (prefix in {'databases.RMRB', 'databases.PLA'} or prefix == 'archives.item'))
               and not (value == "text" and prefix.rsplit(".", 1)[-1] == "components")):
             skip_value = True
         else:
@@ -179,6 +180,10 @@ def compact_catalog_stream(chunks, compressed=False, *, current, acknowledged,
                     raise ValueError("invalid Reader catalog generation")
                 continue
             if section == "retired_generations":
+                if (acknowledged and item.get('withdrawal_reset_id')
+                        and item.get('replacement_acks') != {'hf': True, 'pages': True}):
+                    item = {**item, 'replacement_generation': current,
+                            'replacement_acks': {'hf': True, 'pages': True}, 'retired_at': stamp}
                 retired[name] = item
                 continue
             item.setdefault("generation", name)

@@ -11,7 +11,7 @@ import copy
 import re
 import statistics
 
-VERSION = "layout-v1"
+VERSION = "layout-v3"
 MODES = {"auto", "horizontal-ltr", "horizontal-rtl", "vertical-rl", "vertical-lr"}
 
 
@@ -31,6 +31,23 @@ def validate_options(options):
             raise ValueError("invalid layout region")
         if region.get("writing_mode", "auto") not in MODES:
             raise ValueError("invalid region writing mode")
+        if region.get('rotation',0) not in (0,90,180,270):
+            raise ValueError('invalid region recognition rotation')
+        if 'rotation' in region:
+            if region.get('writing_mode','auto') not in {'auto','horizontal-ltr'}:
+                raise ValueError('rotated region recognition requires horizontal-ltr or auto')
+    rotated=[r for r in options.get('regions',[]) if r.get('rotation',0)]
+    if rotated:
+        regions=options['regions']
+        for index,first in enumerate(regions):
+            a=first['box']
+            for second in regions[index+1:]:
+                b=second['box']
+                if min(a[2],b[2])>max(a[0],b[0])+1e-9 and min(a[3],b[3])>max(a[1],b[1])+1e-9:
+                    raise ValueError('recognition regions must not overlap')
+        area=sum((r['box'][2]-r['box'][0])*(r['box'][3]-r['box'][1]) for r in regions)
+        if abs(area-1)>1e-8:
+            raise ValueError('rotated recognition regions require complete page coverage')
     return options
 
 
@@ -117,6 +134,20 @@ def groups(blocks, mode, width, height, depth=0):
         return []
     vertical = mode.startswith("vertical")
     if vertical:
+        # Books with two horizontal tiers of vertical columns read the whole
+        # upper tier before the lower. Grouping by x first interleaves them.
+        column_width = statistics.median(max(1e-6, b['b'][2] - b['b'][0]) for b in blocks)
+        # Keep a separately printed page number at the end instead of joining
+        # it to the rightmost body column. It is retained with its own offsets.
+        footers = [b for b in blocks if b.get('detector_class') == 9 or
+                   b['t'].strip().isdigit() and b['b'][1] >= .94]
+        body = [b for b in blocks if b not in footers]
+        if footers and body and max(b['b'][3] for b in body) < min(b['b'][1] for b in footers):
+            return groups(body, mode, width, height, depth + 1) + [[b] for b in sorted(footers, key=lambda b: b['b'][0])]
+        cut = gap_split(blocks, 1, max(.012, .6 * column_width * width / height)) if depth < 12 else None
+        separated_heading = cut and min(b['b'][1] for b in cut[1]) - max(b['b'][3] for b in cut[0]) >= 2 * column_width * width / height
+        if cut and (all(len(part) >= 2 for part in cut) or separated_heading):
+            return [group for part in cut for group in groups(part, mode, width, height, depth + 1)]
         # Group tall/single-character fragments sharing a column; do not read
         # a row across adjacent vertical columns.
         columns = []
@@ -180,7 +211,7 @@ def groups(blocks, mode, width, height, depth=0):
 
 
 def cjk(char):
-    return bool(char and re.fullmatch(r"[\u3400-\u9fff\uf900-\ufaff]", char))
+    return bool(char and re.fullmatch(r"[\u3040-\u30ff\u3400-\u9fff\uf900-\ufaff]", char))
 
 
 def soft_boundary(previous, current, group, mode):
@@ -209,6 +240,17 @@ def soft_boundary(previous, current, group, mode):
 
 def inline_boundary(previous, current, mode, width, height):
     if mode.startswith("vertical"):
+        proof=current.get('segmentation',{})
+        before=previous.get('segmentation',{})
+        index=current.get('segmentation_part')
+        if (proof.get('profile')=='vertical-blank-sections-v2-title-spaces' and proof.get('accepted')
+                and before==proof and type(index) is int and index>0
+                and previous.get('segmentation_part')==index-1 and index<len(proof.get('parts',[]))
+                and proof['parts'][index].get('separator_before')=='　'):
+            a,b=previous['b'],current['b']
+            column_width=min(a[2]-a[0],b[2]-b[0])
+            if (abs(a[0]-b[0])<.25*column_width and 0<b[1]-a[3]<1.6*column_width*width/height):
+                return '　'
         return None
     a, b = previous["b"], current["b"]
     overlap = min(a[3], b[3]) - max(a[1], b[1])
@@ -243,6 +285,8 @@ def arrange(blocks, width, height, options=None, *, include_writing_modes=False)
         review.append("within-block-character-order-unverified")
     partitions = []
     remaining = list(working)
+    folios = [b for b in remaining if b.get('detector_class') == 9]
+    remaining = [b for b in remaining if b not in folios]
     for region in options.get("regions", []):
         x0, y0, x1, y1 = region["box"]
         selected = [b for b in remaining if x0 <= (b["b"][0] + b["b"][2]) / 2 <= x1
@@ -253,9 +297,15 @@ def arrange(blocks, width, height, options=None, *, include_writing_modes=False)
             region_mode = infer_mode(selected, width, height)[0]
         partitions.append((selected, region_mode))
     if remaining:
-        partitions.append((remaining, mode))
+        if not options.get('regions') and all(type(b.get('section')) is int for b in remaining):
+            for section in sorted({b['section'] for b in remaining}, reverse=mode in {'vertical-rl', 'horizontal-rtl'}):
+                partitions.append(([b for b in remaining if b['section'] == section], mode))
+        else:
+            partitions.append((remaining, mode))
         if options.get("regions"):
             review.append("blocks-outside-explicit-regions")
+    if folios:
+        partitions.append((folios, 'horizontal-ltr'))
     text, spans, ordered, boundaries = "", [], [], []
     group_index = 0
     for partition, partition_mode in partitions:
@@ -293,7 +343,33 @@ def restore_coordinates(payload, clockwise):
             block["b"] = map_box_back(block["b"], clockwise)
             if "q" in block:
                 block["q"] = [list(map_point_back(x, y, clockwise)) for x, y in block["q"]]
+            if block.get('fraction_bar_evidence'):
+                proof=block['fraction_bar_evidence']
+                proof['recognition_bar_box']=list(proof['bar_box'])
+                proof['recognition_rotation_clockwise']=clockwise
+                proof['bar_box']=map_box_back(proof['bar_box'],clockwise)
+                proof['box']=map_box_back(proof['box'],clockwise)
     for span in payload["text_spans"]:
         span["box"] = map_box_back(span["box"], clockwise)
+    for table in payload['layout'].get('tables', []):
+        # Logical row/column numbers stay in reading order. Axes are qualified
+        # by their rotation; cells and polygons map to original page pixels.
+        table['grid_rotation_clockwise'] = clockwise
+        table['grid_box'] = list(table['box'])
+        table['box'] = map_box_back(table['box'], clockwise)
+        for cell in table['cells']:
+            cell['box'] = map_box_back(cell['box'], clockwise)
+            if cell.get('dot_leader'):
+                cell['dot_leader']['boxes']=[map_box_back(box,clockwise) for box in cell['dot_leader']['boxes']]
+        for edge in table.get('review', []):
+            if 'segments' in edge:
+                edge['segments'] = [[*map_point_back(x0,y0,clockwise),*map_point_back(x1,y1,clockwise)]
+                                    for x0,y0,x1,y1 in edge['segments']]
+    for fraction in payload['layout'].get('fractions',[]):
+        fraction['recognition_box']=list(fraction['box'])
+        fraction['recognition_bar_box']=list(fraction['bar_box'])
+        fraction['recognition_rotation_clockwise']=clockwise
+        fraction['box']=map_box_back(fraction['box'],clockwise)
+        fraction['bar_box']=map_box_back(fraction['bar_box'],clockwise)
     payload["layout"]["rotation_clockwise"] = clockwise
     return payload

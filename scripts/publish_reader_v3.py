@@ -44,8 +44,9 @@ class PublicationReviewRequired(ValueError):
 PUBLIC_OBJECT = re.compile(
     r"objects/[0-9a-f]{2}/[0-9a-f]{64}/[0-9a-f]{16}/(?:document\.pdf|document\.djvu|"
     r"reading-manifest\.json|page-map\.json\.gz|text-layer-manifest\.json|"
+    r"pages/page-[0-9]{6}\.jxl|"
     r"text/(?:page-[0-9]{6}\.json\.gz|book-text\.json\.gz|search-[0-9]{6}-[0-9]{6}\.json\.gz|partition-[0-9]{6}-[0-9]{6}-manifest\.json)|"
-    r"preview/(?:page-[0-9]{6}\.(?:png|webp|jpeg|svg)|partition-[0-9]{6}-[0-9]{6}-manifest\.json))")
+    r"preview/(?:page-[0-9]{6}\.(?:png|webp|jpeg|svg|jxl)|partition-[0-9]{6}-[0-9]{6}-manifest\.json))")
 
 
 def encode(value):
@@ -339,8 +340,8 @@ def stage(store, ref, bundle=None, *, apply=False):
     validate_reading_ref(ref)
     reader = CandidateReader(store, bundle)
     manifest = v3.verify_reading(ref, reader)
-    if not manifest["preview"]["complete"]:
-        raise ValueError("promotion candidate requires complete previews")
+    if not v3.reading_surface_ready(manifest):
+        raise ValueError("promotion requires a primary PDF or complete DjVu previews")
     reader.closure()
     body = {"version": 1, "kind": "reader-reading-candidate", "source_key": manifest["source_key"],
             "source_sha256": manifest["source_sha256"], "reading_generation": manifest["generation"],
@@ -494,13 +495,16 @@ def build_stage(store, spec, workspace, *, apply=False):
     if reuse:
         previous = v3.verify_reading(validate_reading_ref(reuse), reader)
         if (previous["source_key"] != key or previous["source_sha256"] != source
-                or previous["primary"]["resource"] != spec["primary"] or not previous["preview"]["complete"]):
+                or previous["primary"]["resource"] != spec["primary"]
+                or previous['primary']['kind'] == 'djvu' and not previous["preview"]["complete"]):
             raise ValueError("preview reuse source mismatch")
         previews = [entry for part in previous["preview"]["partitions"]
                     for entry in v3.decode(v3.verified_read(part["resource"], reader))["pages"]]
     if spec.get("preview_only"):
         reading_spec = {"source_key": key, "source_sha256": source, "primary": spec["primary"],
                         "require_complete_preview": True, "vector_previews": spec.get("vector_previews", False)}
+        if spec.get("render_manifest"):
+            reading_spec["render_manifest"] = spec["render_manifest"]
         preview_started = time.monotonic()
         if previews is None:
             reading_spec = v3.generate_previews(reading_spec, reader, workspace,
@@ -513,6 +517,8 @@ def build_stage(store, spec, workspace, *, apply=False):
         result = stage(store, ref, workspace, apply=apply)
         result.update(reading=ref, components=manifest["components"])
         result["build"] = {"preview_only": True, "reused_preview_pages": len(previews or []),
+                           "shared_render_pages": sum(p.get("recipe", {}).get("policy") == "shared-document-render-v1"
+                                                      for p in reading_spec.get("previews", [])),
                            "preview_seconds": round(preview_seconds, 3),
                            "total_seconds": round(time.monotonic() - started, 3)}
         return result
@@ -549,6 +555,8 @@ def build_stage(store, spec, workspace, *, apply=False):
     reading_spec = {"source_key": key, "source_sha256": source, "primary": spec["primary"],
                     "text_layer": text_ref, "require_complete_preview": True,
                     "vector_previews": spec.get("vector_previews", False)}
+    if spec.get("render_manifest"):
+        reading_spec["render_manifest"] = spec["render_manifest"]
     preview_started = time.monotonic()
     if previews is None:
         reading_spec = v3.generate_previews(reading_spec, reader, workspace,
@@ -562,6 +570,8 @@ def build_stage(store, spec, workspace, *, apply=False):
     result["reading"] = ref
     result["components"] = manifest["components"]
     result["build"] = {"preview_only": False, "reused_preview_pages": len(previews or []),
+                       "shared_render_pages": sum(p.get("recipe", {}).get("policy") == "shared-document-render-v1"
+                                                  for p in reading_spec.get("previews", [])),
                        "preview_seconds": round(preview_seconds, 3),
                        "total_seconds": round(time.monotonic() - started, 3)}
     return result
@@ -579,7 +589,7 @@ def promote(store, candidate_ref, expected_parent, *, apply=False, replace_sourc
     verified = CandidateReader(store)
     manifest = v3.verify_reading(candidate["reading"], verified)
     verified.closure()
-    if (not manifest["preview"]["complete"]
+    if (not v3.reading_surface_ready(manifest)
             or candidate["source_key"] != manifest["source_key"]
             or candidate["reading_generation"] != manifest["generation"]
             or candidate["source_sha256"] != manifest["source_sha256"]):
@@ -622,7 +632,7 @@ def promote(store, candidate_ref, expected_parent, *, apply=False, replace_sourc
         if (previous["source_sha256"] != manifest["source_sha256"]
                 or previous["primary"] != manifest["primary"]
                 or not same_map
-                or previews(previous) != previews(manifest)):
+                or (manifest['primary']['kind'] == 'djvu' and previews(previous) != previews(manifest))):
             raise ValueError("text upgrade must preserve the complete existing preview")
     verified.close()
     files = {**old["files"], key: entry}
@@ -667,6 +677,17 @@ def commit_catalog(store, catalog, pointer, *, apply=False):
         store.put_bytes(ASSETS, history_path, encode(history))
     if current(store)[0] != pointer:
         raise ValueError("reading pointer changed before promotion")
+    if pointer:
+        try:
+            from . import reader_gc_retirement as retirement
+        except ImportError:
+            import reader_gc_retirement as retirement
+        _, prior = current(store)
+        hint = retirement.record([entry['resource'] for entry in prior['files'].values()],
+                                 [entry['resource'] for entry in catalog['files'].values()],
+                                 generation, 'v3-replacement')
+        if hint:
+            store.put_bytes(ASSETS, hint[0], retirement.encode(hint[1]))
     store.put_bytes(ASSETS, POINTER, encode(new_pointer))
     if current(store)[0] != new_pointer:
         raise ValueError("reading pointer verification failed")
@@ -1010,7 +1031,7 @@ class CentralHubStore(HubBucketStore):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=("build-stage", "stage", "promote", "rollback", "withdraw", "ack", "ack-all", "acknowledge-legacy", "compact-legacy", "inspect", "project", "auto", "build-task", "correct", "accept", "reject", "retry", "retire", "retire-ocr-progress", "unify", "repair-gbk"))
+    parser.add_argument("command", choices=("build-stage", "stage", "promote", "rollback", "withdraw", "ack", "ack-all", "acknowledge-legacy", "compact-legacy", "inspect", "project", "auto", "build-task", "correct", "accept", "reject", "retry", "retire", "retire-ocr-progress", "unify", "repair-gbk", "reset-documents"))
     parser.add_argument("--resource", type=Path)
     parser.add_argument("--resource-json")
     parser.add_argument("--bundle", type=Path)
@@ -1020,7 +1041,16 @@ def main():
     parser.add_argument("--surface", choices=("hf", "pages"))
     args = parser.parse_args()
     store = CentralHubStore()
-    if args.command == "unify":
+    if args.command == "reset-documents":
+        try:
+            from .reader_document_reset import withdraw as reset_documents, DocumentProducerFence
+        except ImportError:
+            from reader_document_reset import withdraw as reset_documents, DocumentProducerFence
+        if args.apply:
+            store.assert_serialized_writer(PROTOCOL)
+            DocumentProducerFence().check()
+        report = reset_documents(store, json.loads(args.resource_json or '{}'), apply=args.apply)
+    elif args.command == "unify":
         report = unify(store, apply=args.apply)
     elif args.command == "repair-gbk":
         try:
